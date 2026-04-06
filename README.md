@@ -74,14 +74,14 @@ See `tutorial.ipynb` for a walkthrough of model setup, training, and inference.
 
 If you use SpliceVI in your work, please cite:
 
-> Vaidyanathan et al. (2026). *SpliceVI: Multimodal variational inference for joint modeling of alternative splicing and gene expression*. bioRxiv. https://doi.org/10.1101/XXXXXX
+> Vaidyanathan S, Isaev K, Zweig A, Knowles DA. *Robust Integration of Sparse Single-Cell Alternative Splicing and Gene Expression Data with SpliceVI*. bioRxiv 2025.11.26.690853. https://doi.org/10.1101/2025.11.26.690853
 
 ```bibtex
-@article{vaidyanathan2026splicevi,
-  title   = {SpliceVI: Multimodal variational inference for joint modeling of alternative splicing and gene expression},
-  author  = {Vaidyanathan, Siddharth and ...},
+@article{vaidyanathan2025splicevi,
+  title   = {Robust Integration of Sparse Single-Cell Alternative Splicing and Gene Expression Data with {SpliceVI}},
+  author  = {Vaidyanathan, Smriti and Isaev, Keren and Zweig, Aaron and Knowles, David A},
   journal = {bioRxiv},
-  year    = {2026},
-  doi     = {10.1101/XXXXXX}
+  year    = {2025},
+  doi     = {10.1101/2025.11.26.690853}
 }
 ```
