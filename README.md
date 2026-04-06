@@ -34,10 +34,10 @@ After installation, `from splicevi import SPLICEVI` works from any script or not
 ```
 SpliceVI/
 ├── src/splicevi/
-│   ├── splicevi.py          # SPLICEVI model class (training, inference, DE)
-│   ├── splicevae.py         # VAE module (encoder/decoder architecture)
-│   ├── partialvae.py        # Partial VAE module for missing-modality imputation
-│   ├── eddisplice.py        # EDDISPLICE model class for single-modality splice-only VAE using PARTIALVAE
+│   ├── splicevi.py          # SPLICEVI model class for GE+AS (training, inference, DE, DS)
+│   ├── splicevae.py         # VAE module for GE+AS (encoder/decoder architecture)
+│   ├── partialvae.py        # AS Missingness-Aware Partial VAE module
+│   ├── eddisplice.py        # EDDISPLICE model class for single-modality AS-only VAE using PARTIALVAE
 │   └── __init__.py          # Package exports
 ├── train_splicevi.py        # Training entry point
 ├── eval_splicevi.py         # Evaluation entry point (UMAPs, metrics, imputation)
