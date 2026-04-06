@@ -43,7 +43,7 @@ SpliceVI/
 ├── eval_splicevi.py         # Evaluation entry point (UMAPs, metrics, imputation)
 ├── train_splicevi.sh        # SLURM job script for training
 ├── eval_splicevi.sh         # SLURM job script for evaluation
-├── tutorial.ipynb           # End-to-end usage tutorial
+├── TBA: tutorial.ipynb      # End-to-end usage tutorial (Future Addition)
 ├── pyproject.toml           # Package configuration
 └── requirements.txt         # Full conda environment freeze
 ```
