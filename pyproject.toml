@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splicevi"
+version = "0.1.0"
+description = "SpliceVI: a multi-modal VAE for joint RNA expression and splicing"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "scvi-tools>=1.4.1",
+    "mudata>=0.3",
+    "anndata>=0.10",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "scanpy>=1.9",
+    "tqdm",
+    "matplotlib",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+wandb = ["wandb"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
