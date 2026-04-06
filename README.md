@@ -70,6 +70,10 @@ See `tutorial.ipynb` for a walkthrough of model setup, training, and inference.
 
 ---
 
-## Companion repository
+## Citation
 
-Preprocessing, downstream analyses, and manuscript figures: [SpliceVI-utils](https://github.com/your-org/SpliceVI-utils)
+If you use SpliceVI in your work, please cite:
+
+> Robust Integration of Sparse Single-Cell Alternative Splicing and Gene Expression Data with SpliceVI
+Smriti Vaidyanathan, Keren Isaev, Aaron Zweig, David A Knowles
+bioRxiv 2025.11.26.690853; doi: https://doi.org/10.1101/2025.11.26.690853
