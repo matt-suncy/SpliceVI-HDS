@@ -77,7 +77,7 @@ If you use SpliceVI in your work, please cite:
 > Vaidyanathan S, Isaev K, Zweig A, Knowles DA. *Robust Integration of Sparse Single-Cell Alternative Splicing and Gene Expression Data with SpliceVI*. bioRxiv 2025.11.26.690853. https://doi.org/10.1101/2025.11.26.690853
 
 ```bibtex
-@article{vaidyanathan2025splicevi,
+@article{splicevi,
   title   = {Robust Integration of Sparse Single-Cell Alternative Splicing and Gene Expression Data with {SpliceVI}},
   author  = {Vaidyanathan, Smriti and Isaev, Keren and Zweig, Aaron and Knowles, David A},
   journal = {bioRxiv},
