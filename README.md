@@ -16,7 +16,7 @@ conda activate splicevi-env
 ### 2. Install the package
 
 ```bash
-git clone https://github.com/your-org/SpliceVI.git
+git clone https://github.com/daklab/SpliceVI.git
 cd SpliceVI
 pip install -e .
 ```
