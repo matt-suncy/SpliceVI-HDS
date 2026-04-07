@@ -20,7 +20,7 @@ mkdir -p data/processed models logs
 python scripts/build_splicevi_mudata.py \
   --expr-matrix data/Tasic2018_MO_VIS_core.individual.expr.mat.txt \
   --splicing-matrix data/MO_VIS_core.individual.cass.mat.txt \
-  --metadata-csv data/MO_sample_metadata.csv \
+  --metadata-csvs data/MO_sample_metadata.csv data/VIS_sample_metadata.csv \
   --expr-group-map data/MO_VIS_core.individual2group.expr.conf \
   --as-group-map data/MO_VIS_core.individual2group.as.conf \
   --output-h5mu data/processed/splicevi_custom_input.h5mu \
@@ -35,4 +35,4 @@ python train_splicevi.py \
   --train_mdata_path data/processed/splicevi_custom_input.h5mu \
   --model_dir models/custom_baseline_$(date +"%Y%m%d_%H%M%S") \
   --batch_key None \
-  --max_epochs 10
+  --max_epochs 1 # Just 1 epoch for testing; increase for real training

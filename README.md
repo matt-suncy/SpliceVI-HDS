@@ -75,7 +75,7 @@ If your data starts as separate expression/splicing/metadata tables in `data/`, 
 python scripts/build_splicevi_mudata.py \
   --expr-matrix data/Tasic2018_MO_VIS_core.individual.expr.mat.txt \
   --splicing-matrix data/MO_VIS_core.individual.cass.mat.txt \
-  --metadata-csv data/MO_sample_metadata.csv \
+  --metadata-csvs data/MO_sample_metadata.csv data/VIS_sample_metadata.csv \
   --expr-group-map data/MO_VIS_core.individual2group.expr.conf \
   --as-group-map data/MO_VIS_core.individual2group.as.conf \
   --output-h5mu data/processed/splicevi_custom_input.h5mu

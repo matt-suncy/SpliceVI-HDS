@@ -93,16 +93,24 @@ def _load_group_map(path: Path | None, key_name: str) -> pd.Series | None:
     return gdf.drop_duplicates("sample").set_index("sample")[key_name]
 
 
+def _read_metadata_csv(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, dtype=str)
+    except UnicodeDecodeError:
+        return pd.read_csv(path, dtype=str, encoding="latin1")
+
+
 def _make_obs(
-    metadata_path: Path,
+    metadata_paths: list[Path],
     shared_samples: list[str],
     expr_group_map: pd.Series | None,
     as_group_map: pd.Series | None,
 ) -> pd.DataFrame:
-    try:
-        obs = pd.read_csv(metadata_path, dtype=str)
-    except UnicodeDecodeError:
-        obs = pd.read_csv(metadata_path, dtype=str, encoding="latin1")
+    if not metadata_paths:
+        raise ValueError("At least one metadata CSV path must be provided.")
+
+    frames = [_read_metadata_csv(p) for p in metadata_paths]
+    obs = pd.concat(frames, axis=0, ignore_index=True)
     if "seq_name" not in obs.columns:
         raise ValueError("metadata file must contain a 'seq_name' column.")
 
@@ -184,7 +192,8 @@ def build(args: argparse.Namespace) -> None:
     if args.max_splicing_features > 0:
         sp_df = sp_df.head(args.max_splicing_features).copy()
 
-    obs = _make_obs(Path(args.metadata_csv), shared_samples, expr_group_map, as_group_map)
+    metadata_paths = [Path(p) for p in args.metadata_csvs]
+    obs = _make_obs(metadata_paths, shared_samples, expr_group_map, as_group_map)
 
     # Align matrices to shared sample ordering and coerce to numeric.
     expr_vals = expr_df[shared_samples].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
@@ -219,6 +228,8 @@ def build(args: argparse.Namespace) -> None:
     rna = ad.AnnData(X=rna_x, obs=rna_obs, var=rna_var)
     rna.layers["length_norm"] = rna_x.copy()
     libsize = np.asarray(rna_x.sum(axis=1)).ravel().astype(np.float32)
+    # Keep both locations for compatibility with SpliceVI/scvi variants.
+    rna.obs["X_library_size"] = libsize
     rna.obsm["X_library_size"] = libsize.reshape(-1, 1)
 
     # Build splicing modality.
@@ -293,8 +304,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--metadata-csv",
-        default="data/MO_sample_metadata.csv",
-        help="Metadata CSV path containing seq_name and donor metadata.",
+        default=None,
+        help="Deprecated single metadata CSV path; use --metadata-csvs instead.",
+    )
+    parser.add_argument(
+        "--metadata-csvs",
+        nargs="+",
+        default=["data/MO_sample_metadata.csv", "data/VIS_sample_metadata.csv"],
+        help="One or more metadata CSV files containing seq_name and donor metadata.",
     )
     parser.add_argument(
         "--expr-group-map",
@@ -341,7 +358,10 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="If >0, keep only the first N splicing features.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.metadata_csv and args.metadata_csvs == ["data/MO_sample_metadata.csv", "data/VIS_sample_metadata.csv"]:
+        args.metadata_csvs = [args.metadata_csv]
+    return args
 
 
 if __name__ == "__main__":
