@@ -65,6 +65,75 @@ python train_splicevi.py --help
 python eval_splicevi.py --help
 ```
 
+## Custom Data Workflow (Tables -> .h5mu -> Train)
+
+If your data starts as separate expression/splicing/metadata tables in `data/`, use:
+
+1. Build a model-ready MuData file:
+
+```bash
+python scripts/build_splicevi_mudata.py \
+  --expr-matrix data/Tasic2018_MO_VIS_core.individual.expr.mat.txt \
+  --splicing-matrix data/MO_VIS_core.individual.cass.mat.txt \
+  --metadata-csv data/MO_sample_metadata.csv \
+  --expr-group-map data/MO_VIS_core.individual2group.expr.conf \
+  --as-group-map data/MO_VIS_core.individual2group.as.conf \
+  --output-h5mu data/processed/splicevi_custom_input.h5mu
+```
+
+For a quick smoke test on a subset, add:
+
+```bash
+  --max-cells 512 --max-expr-features 5000 --max-splicing-features 5000
+```
+
+2. Validate that the generated `.h5mu` has all required fields/layers:
+
+```bash
+python scripts/validate_splicevi_mudata.py \
+  --h5mu data/processed/splicevi_custom_input.h5mu
+```
+
+3. Train using the generated file:
+
+```bash
+python train_splicevi.py \
+  --train_mdata_path data/processed/splicevi_custom_input.h5mu \
+  --model_dir models/custom_baseline_run \
+  --batch_key None
+```
+
+One-command helper:
+
+```bash
+bash scripts/run_custom_pipeline.sh
+```
+
+### Required Output Schema for `train_splicevi.py`
+
+The builder writes a `.h5mu` with:
+
+- Modalities: `rna` and `splicing`
+- `rna.layers['length_norm']`
+- `rna.obsm['X_library_size']`
+- `rna.var['modality'] == 'Gene_Expression'`
+- `splicing.layers['junc_ratio']`
+- `splicing.layers['cell_by_junction_matrix']`
+- `splicing.layers['cell_by_cluster_matrix']`
+- `splicing.layers['psi_mask']`
+- `splicing.var['modality'] == 'Splicing'`
+- `splicing.var['event_id']` (ATSE grouping)
+- `obs['donor_id']`
+
+### Notes on Pseudo-counts
+
+If raw splicing count matrices are not available, the builder derives pseudo junction
+counts from PSI values using `--pseudo-depth` and then computes ATSE totals by summing
+junction pseudo-counts within each `event_id` group.
+
+This enables training with ratio-only splicing inputs, but raw-count-based layers are
+preferred when available.
+
 Future additions:
 - [ ] Add `tutorial.ipynb` for a walkthrough of model setup, training, and application to other datasets.
 - [ ] Add trained models to Hugging Face

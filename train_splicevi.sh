@@ -29,7 +29,7 @@ set -euo pipefail
 #######################################
 
 # 1) Paths
-TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS.h5mu"
+TRAIN_MDATA_PATH="data/processed/splicevi_custom_input.h5mu"
 # TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS_SUBSAMPLED_N_50000_SUBSAMPLED_N_25000_SUBSAMPLED_N_10000.h5mu"
 # TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS_SUBSAMPLED_N_50000_SUBSAMPLED_N_25000.h5mu"
 # TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS_SUBSAMPLED_N_50000.h5mu"
@@ -49,7 +49,7 @@ SCRIPT_PATH="train_splicevi.py"
 BATCH_KEY="None"
 
 # 2) Conda / environment
-CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"
+CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
 ENV_NAME="splicevi-env"
 
 # 3) Core hyperparameters
