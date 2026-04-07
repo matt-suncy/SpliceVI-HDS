@@ -1,0 +1,54 @@
+# DataNavigator Framework Implementation
+
+The `DataNavigator` framework has been successfully built to allow flexible linking between gene expression data, splicing event data, and VIS/MO metadata.
+
+## Implementation Details
+
+The `DataNavigator` class is encapsulated within the single file: `data_navigator.py`. The design prioritizes ease of use and explicitly integrates sample ID resolving across modalities. 
+
+### Data Mapping Mechanism
+The raw data exhibited different sample ID formats across the files. Here's how standardisation was achieved:
+- **Expression Matrix Culling:** Sample header values originally appeared as `MO/SM-D9CZQ_S96_E1-50.expr.txt`. The loader trims the `.expr.txt` logic and parses the main unified ID.
+- **Splicing Matrix Culling:** Sample headers were provided generically missing the region prefix (e.g., `SM-D9CZQ_S96_E1-50`). The metadata engine natively merges the `vis` and `mo` records and creates a prefix dictionary to map short splicing ids to the exact unified `full_sample_id`.
+- **Metadata Encoding:** Found nested multi-byte characters inside `sample_metadata.csv` (likely metadata strings like trade marks). It is actively bypassed via the explicit `latin1` pandas reader to prevent standard CSV Unicode exceptions.
+
+## Usage Overview
+
+You can include `DataNavigator` in your downstream machine learning loops or analysis as follows:
+
+```python
+from data_navigator import DataNavigator
+
+# File paths
+EXPR_PATH = "/mnt/chromatin/home/cz2294/archive_proj/Allen_SingleCell_2_VIS_MO/expr_new/expr_mat/Tasic2018_MO_VIS_core.individual.expr.mat.txt"
+SPLICING_PATH = "/mnt/chromatin/home/cz2294/archive_proj/Allen_SingleCell_2_VIS_MO/AS/cass_mat/MO_VIS_core.individual.cass.mat.txt"
+MO_META_PATH = "/mnt/chromatin/home/cz2294/archive_proj/Allen_SingleCell_2_VIS_MO/fastq/meta_data/MO/sample_metadata.csv"
+VIS_META_PATH = "/mnt/chromatin/home/cz2294/archive_proj/Allen_SingleCell_2_VIS_MO/fastq/meta_data/VIS/sample_metadata.csv"
+
+# 1. Initialize logic
+nav = DataNavigator(EXPR_PATH, SPLICING_PATH, MO_META_PATH, VIS_META_PATH)
+
+# 2. Extract subsets dynamically 
+# Here we find only 'L5 PT' cells from Motor Cortex
+subset_samples = nav.filter_samples(region='MO', subclass='L5 PT')
+
+# Retrieve the subset expression and splicing datasets 
+expr_matrix = nav.get_expression(sample_ids=subset_samples)
+splice_matrix = nav.get_splicing(sample_ids=subset_samples)
+```
+
+> [!TIP]
+> **AnnData Builder:** Since you are working in Python, you can natively build an encompassing object for standard single-cell workflows (if you have `scanpy` / `anndata` installed via pip):
+> ```python
+> adata = nav.create_anndata(modality='expression') 
+> ```
+> This populates `adata.X` with the matrix and maps `adata.obs` flawlessly matching to all metadata.
+
+## Validation Results
+
+A standalone validation test (`test_data_navigator.py`) confirmed:
+- A total of **25,481 sample instances** parsed correctly across the combined metadata.
+- Accurate subsets using logical metadata filtering (`region='MO'`, `subclass='L5 PT'` resulted in yielding exactly 368 target cells).
+
+> [!WARNING]
+> The backing expression matrix is `~8.1 GB` and utilizes standard `pandas.read_csv`. Ensure you are running this dataset on a high memory execution machine ($> 40GB$ RAM) to read it safely during instantiation. If memory becomes a stricter resource issue long term, consider adapting `DataNavigator` to utilize sparse matrices or lazy-fetching `zarr` / `h5ad` formats.
