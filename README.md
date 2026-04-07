@@ -43,7 +43,6 @@ SpliceVI/
 ├── eval_splicevi.py         # Evaluation entry point (UMAPs, metrics, imputation)
 ├── train_splicevi.sh        # SLURM job script for training
 ├── eval_splicevi.sh         # SLURM job script for evaluation
-├── TBA: tutorial.ipynb      # End-to-end usage tutorial (Future Addition)
 ├── pyproject.toml           # Package configuration
 └── requirements.txt         # Full conda environment freeze
 ```
@@ -66,8 +65,9 @@ python train_splicevi.py --help
 python eval_splicevi.py --help
 ```
 
-See `tutorial.ipynb` for a walkthrough of model setup, training, and inference.
-
+Future additions:
+- [ ] Add `tutorial.ipynb` for a walkthrough of model setup, training, and application to other datasets.
+- [ ] Add trained models to Hugging Face
 ---
 
 ## Citation
