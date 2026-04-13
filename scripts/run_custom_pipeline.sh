@@ -6,16 +6,20 @@ set -euo pipefail
 # 2) Validate schema compatibility with SpliceVI
 # 3) Start training with train_splicevi.py
 
-CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
+# CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
 ENV_NAME="${ENV_NAME:-splicevi-env}"
 MAX_CELLS="${MAX_CELLS:--1}"
 MAX_EXPR_FEATURES="${MAX_EXPR_FEATURES:--1}"
 MAX_SPLICING_FEATURES="${MAX_SPLICING_FEATURES:--1}"
 
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
+# source "${CONDA_BASE}/etc/profile.d/conda.sh"
+
+eval "$(conda shell.bash hook)"
 conda activate "${ENV_NAME}"
 
 mkdir -p data/processed models logs
+
+echo "Building SpliceVI MuData object with max_cells=${MAX_CELLS}, max_expr_features=${MAX_EXPR_FEATURES}, max_splicing_features=${MAX_SPLICING_FEATURES}..."
 
 python scripts/build_splicevi_mudata.py \
   --expr-matrix data/Tasic2018_MO_VIS_core.individual.expr.mat.txt \
@@ -28,8 +32,12 @@ python scripts/build_splicevi_mudata.py \
   --max-expr-features "${MAX_EXPR_FEATURES}" \
   --max-splicing-features "${MAX_SPLICING_FEATURES}"
 
+echo "Validating SpliceVI MuData object schema compatibility..."
+
 python scripts/validate_splicevi_mudata.py \
   --h5mu data/processed/splicevi_custom_input.h5mu
+
+echo "Starting SpliceVI training with custom data..."
 
 python train_splicevi.py \
   --train_mdata_path data/processed/splicevi_custom_input.h5mu \
