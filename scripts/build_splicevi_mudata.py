@@ -18,6 +18,13 @@ import pandas as pd
 from scipy import sparse
 
 
+EVENT_ID_RE = re.compile(
+    r"^(?P<event_type>[^-\[]+)-(?P<gene_id>[^-\[]+)-(?P<upstream_end>\d+)-"
+    r"(?P<cassette_start>\d+)-(?P<cassette_end>\d+)-(?P<downstream_start>\d+)"
+    r"(?:\[(?P<tag1>[^\]]+)\])(?:\[(?P<tag2>[^\]]+)\])(?:\[[^\]]+\])*$"
+)
+
+
 def _canonicalize_sample_id(sample_id: str) -> str:
     """Normalize sample identifiers across expression/splicing/metadata files."""
     sid = str(sample_id).strip()
@@ -27,13 +34,57 @@ def _canonicalize_sample_id(sample_id: str) -> str:
     return sid
 
 
-def _derive_event_group(junction_id: str) -> str:
-    """Derive ATSE grouping key from a junction identifier.
+def _parse_event_id(event_id: str) -> dict[str, int | str]:
+    """Parse event_id into coordinates and support counts.
 
-    Example:
-    CA-...-170683[INC][40/1][DNT] -> CA-...-170683
+    Expected format:
+    CA-gene-upstream_end-cassette_start-cassette_end-downstream_start
+    [inclusion_tag][inclusion_reads/exclusion_reads][optional_tags...]
     """
-    return str(junction_id).split("[")[0]
+    raw = str(event_id)
+    match = EVENT_ID_RE.match(raw)
+    if match is None:
+        raise ValueError(f"Malformed #event_id: {raw}")
+
+    count_match = re.match(r"^(\d+)/(\d+)$", match.group("tag2"))
+    if count_match is None:
+        raise ValueError(
+            "Malformed #event_id count token for "
+            f"'{raw}'; expected second bracket token like '[6/2]'."
+        )
+
+    return {
+        "raw_event_id": raw,
+        "event_type": match.group("event_type"),
+        "gene_id": match.group("gene_id"),
+        "upstream_end": int(match.group("upstream_end")),
+        "cassette_start": int(match.group("cassette_start")),
+        "cassette_end": int(match.group("cassette_end")),
+        "downstream_start": int(match.group("downstream_start")),
+        "inclusion_tag": match.group("tag1"),
+        "inc_support": int(count_match.group(1)),
+        "exc_support": int(count_match.group(2)),
+    }
+
+
+def _derive_event_group(parsed: dict[str, int | str], grouping_mode: str) -> str:
+    """Build event grouping key based on selected anchor matching mode."""
+    event_type = str(parsed["event_type"])
+    gene_id = str(parsed["gene_id"])
+    upstream_end = int(parsed["upstream_end"])
+    downstream_start = int(parsed["downstream_start"])
+
+    if grouping_mode == "both_anchors":
+        return f"{event_type}|{gene_id}|{upstream_end}|{downstream_start}"
+    if grouping_mode == "upstream_only":
+        return f"{event_type}|{gene_id}|{upstream_end}"
+    if grouping_mode == "downstream_only":
+        return f"{event_type}|{gene_id}|{downstream_start}"
+
+    raise ValueError(
+        "Invalid --atse-grouping-mode. Expected one of: "
+        "both_anchors, upstream_only, downstream_only"
+    )
 
 
 def _get_header_columns(path: Path) -> list[str]:
@@ -199,18 +250,18 @@ def build(args: argparse.Namespace) -> None:
     expr_vals = expr_df[shared_samples].apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
     sp_vals_df = sp_df[shared_samples].replace("", np.nan)
     sp_vals = sp_vals_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
-    psi_mask = (~np.isnan(sp_vals)).astype(np.int8)
+    obs_mask = (~np.isnan(sp_vals)).astype(np.int8)
     sp_vals = np.nan_to_num(sp_vals, nan=0.0)
     sp_vals = np.clip(sp_vals, 0.0, 1.0)
 
     if args.min_cells_per_feature > 0:
         expr_keep = (expr_vals > 0).sum(axis=1) >= args.min_cells_per_feature
-        sp_keep = psi_mask.sum(axis=1) >= args.min_cells_per_feature
+        sp_keep = obs_mask.sum(axis=1) >= args.min_cells_per_feature
         expr_df = expr_df.loc[expr_keep].reset_index(drop=True)
         sp_df = sp_df.loc[sp_keep].reset_index(drop=True)
         expr_vals = expr_vals[expr_keep]
         sp_vals = sp_vals[sp_keep]
-        psi_mask = psi_mask[sp_keep]
+        obs_mask = obs_mask[sp_keep]
 
     # Build RNA modality.
     rna_var = pd.DataFrame(
@@ -232,29 +283,108 @@ def build(args: argparse.Namespace) -> None:
     rna.obs["X_library_size"] = libsize
     rna.obsm["X_library_size"] = libsize.reshape(-1, 1)
 
-    # Build splicing modality.
-    junc_ids = sp_df["#event_id"].astype(str)
-    event_groups = junc_ids.map(_derive_event_group)
+    # Build splicing modality from event-level PSI and event_id-derived metadata.
+    raw_event_ids = sp_df["#event_id"].astype(str).to_numpy()
+    gene_names = sp_df["NAME"].astype(str).to_numpy()
+    parsed_events = [_parse_event_id(eid) for eid in raw_event_ids]
+
+    n_events = len(parsed_events)
+    if n_events == 0:
+        raise ValueError("No splicing rows available after filtering.")
+
+    n_junctions = n_events * 2
+    expanded_vals = np.repeat(sp_vals, 2, axis=0)
+    junction_support = np.zeros(n_junctions, dtype=np.float32)
+
+    junc_ids: list[str] = []
+    event_groups_list: list[str] = []
+    gene_name_list: list[str] = []
+    event_type_list: list[str] = []
+    source_event_id_list: list[str] = []
+    junction_side_list: list[str] = []
+    junction_start_list: list[int] = []
+    junction_end_list: list[int] = []
+    upstream_end_list: list[int] = []
+    cassette_start_list: list[int] = []
+    cassette_end_list: list[int] = []
+    downstream_start_list: list[int] = []
+    inc_support_list: list[int] = []
+    exc_support_list: list[int] = []
+
+    for i, (parsed, gene_name) in enumerate(zip(parsed_events, gene_names, strict=True)):
+        event_group = _derive_event_group(parsed, args.atse_grouping_mode)
+        raw_event = str(parsed["raw_event_id"])
+        event_type = str(parsed["event_type"])
+        upstream_end = int(parsed["upstream_end"])
+        cassette_start = int(parsed["cassette_start"])
+        cassette_end = int(parsed["cassette_end"])
+        downstream_start = int(parsed["downstream_start"])
+        inc_support = int(parsed["inc_support"])
+        exc_support = int(parsed["exc_support"])
+
+        # Upstream inclusion junction: (upstream_end, cassette_start)
+        junc_ids.append(f"{raw_event}|JUP:{upstream_end}-{cassette_start}")
+        event_groups_list.append(event_group)
+        gene_name_list.append(str(gene_name))
+        event_type_list.append(event_type)
+        source_event_id_list.append(raw_event)
+        junction_side_list.append("upstream")
+        junction_start_list.append(upstream_end)
+        junction_end_list.append(cassette_start)
+        upstream_end_list.append(upstream_end)
+        cassette_start_list.append(cassette_start)
+        cassette_end_list.append(cassette_end)
+        downstream_start_list.append(downstream_start)
+        inc_support_list.append(inc_support)
+        exc_support_list.append(exc_support)
+        junction_support[2 * i] = float(inc_support)
+
+        # Downstream inclusion junction: (cassette_end, downstream_start)
+        junc_ids.append(f"{raw_event}|JDN:{cassette_end}-{downstream_start}")
+        event_groups_list.append(event_group)
+        gene_name_list.append(str(gene_name))
+        event_type_list.append(event_type)
+        source_event_id_list.append(raw_event)
+        junction_side_list.append("downstream")
+        junction_start_list.append(cassette_end)
+        junction_end_list.append(downstream_start)
+        upstream_end_list.append(upstream_end)
+        cassette_start_list.append(cassette_start)
+        cassette_end_list.append(cassette_end)
+        downstream_start_list.append(downstream_start)
+        inc_support_list.append(inc_support)
+        exc_support_list.append(exc_support)
+        junction_support[2 * i + 1] = float(exc_support)
+
+    event_groups = pd.Series(event_groups_list, dtype=str)
+    junc_id_series = pd.Series(junc_ids, dtype=str)
+    gene_name_series = pd.Series(gene_name_list, dtype=str)
 
     sp_var = pd.DataFrame(
         {
-            "junction_id": junc_ids.to_numpy(),
-            "gene_name": sp_df["NAME"].astype(str).to_numpy(),
+            "junction_id": junc_id_series.to_numpy(),
+            "source_event_id": np.asarray(source_event_id_list, dtype=object),
+            "event_type": np.asarray(event_type_list, dtype=object),
+            "gene_name": gene_name_series.to_numpy(),
             "event_id": event_groups.to_numpy(),
+            "junction_side": np.asarray(junction_side_list, dtype=object),
+            "junction_start": np.asarray(junction_start_list, dtype=np.int32),
+            "junction_end": np.asarray(junction_end_list, dtype=np.int32),
+            "upstream_end": np.asarray(upstream_end_list, dtype=np.int32),
+            "cassette_start": np.asarray(cassette_start_list, dtype=np.int32),
+            "cassette_end": np.asarray(cassette_end_list, dtype=np.int32),
+            "downstream_start": np.asarray(downstream_start_list, dtype=np.int32),
+            "inc_support": np.asarray(inc_support_list, dtype=np.int32),
+            "exc_support": np.asarray(exc_support_list, dtype=np.int32),
             "modality": "Splicing",
         },
-        index=_unique_feature_index(junc_ids, sp_df["NAME"], "junction"),
+        index=_unique_feature_index(junc_id_series, gene_name_series, "junction"),
     )
 
-    ratio_csr = sparse.csr_matrix(sp_vals.T)
-    mask_csr = sparse.csr_matrix(psi_mask.T)
+    ratio_csr = sparse.csr_matrix(expanded_vals.T)
 
-    # Pseudo-count fallback: build junc counts from PSI when raw counts are unavailable.
-    pseudo_depth = int(args.pseudo_depth)
-    junc_counts_dense = np.rint(sp_vals * pseudo_depth).astype(np.int32)
-    observed = psi_mask.astype(bool)
-    junc_counts_dense[observed & (junc_counts_dense == 0)] = 1
-    junc_counts_dense[~observed] = 0
+    junc_counts_dense = np.rint(expanded_vals * junction_support[:, None]).astype(np.int32)
+    junc_counts_dense = np.clip(junc_counts_dense, 0, None)
     junc_counts_csr = sparse.csr_matrix(junc_counts_dense.T)
 
     event_codes, event_uniques = pd.factorize(event_groups, sort=True)
@@ -265,7 +395,13 @@ def build(args: argparse.Namespace) -> None:
         ),
         shape=(len(event_codes), len(event_uniques)),
     ).tocsr()
-    cluster_counts = (junc_counts_csr @ j2e).astype(np.int32)
+    event_cluster_counts = (junc_counts_csr @ j2e).astype(np.int32)
+    cluster_counts = (event_cluster_counts @ j2e.T).astype(np.int32)
+
+    event_observed = (event_cluster_counts > int(args.mask_atse_threshold)).astype(np.int8)
+    mask_csr = (event_observed @ j2e.T).astype(np.int8).tocsr()
+    if mask_csr.nnz > 0:
+        mask_csr.data = np.ones_like(mask_csr.data, dtype=np.int8)
 
     sp_obs = obs.copy()
     sp_obs.index = shared_samples
@@ -288,6 +424,8 @@ def build(args: argparse.Namespace) -> None:
     print(f"Genes: {mdata['rna'].n_vars}")
     print(f"Junctions: {mdata['splicing'].n_vars}")
     print(f"ATSE groups: {len(event_uniques)}")
+    print(f"ATSE grouping mode: {args.atse_grouping_mode}")
+    print(f"Mask threshold (ATSE > threshold): {args.mask_atse_threshold}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -329,10 +467,20 @@ def parse_args() -> argparse.Namespace:
         help="Output .h5mu path.",
     )
     parser.add_argument(
-        "--pseudo-depth",
+        "--atse-grouping-mode",
+        type=str,
+        default="both_anchors",
+        choices=["both_anchors", "upstream_only", "downstream_only"],
+        help=(
+            "How to build event groups for ATSE counts and mask derivation: "
+            "both_anchors (default), upstream_only, or downstream_only."
+        ),
+    )
+    parser.add_argument(
+        "--mask-atse-threshold",
         type=int,
-        default=50,
-        help="Pseudo read depth used to convert PSI to pseudo junction counts.",
+        default=0,
+        help="Binary mask rule: mask=1 when ATSE count > threshold.",
     )
     parser.add_argument(
         "--min-cells-per-feature",

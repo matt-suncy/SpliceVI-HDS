@@ -11,6 +11,8 @@ ENV_NAME="${ENV_NAME:-splicevi-env}"
 MAX_CELLS="${MAX_CELLS:--1}"
 MAX_EXPR_FEATURES="${MAX_EXPR_FEATURES:--1}"
 MAX_SPLICING_FEATURES="${MAX_SPLICING_FEATURES:--1}"
+ATSE_GROUPING_MODE="${ATSE_GROUPING_MODE:-both_anchors}"
+MASK_ATSE_THRESHOLD="${MASK_ATSE_THRESHOLD:-0}"
 
 # source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
@@ -28,6 +30,8 @@ python scripts/build_splicevi_mudata.py \
   --expr-group-map data/MO_VIS_core.individual2group.expr.conf \
   --as-group-map data/MO_VIS_core.individual2group.as.conf \
   --output-h5mu data/processed/splicevi_custom_input.h5mu \
+  --atse-grouping-mode "${ATSE_GROUPING_MODE}" \
+  --mask-atse-threshold "${MASK_ATSE_THRESHOLD}" \
   --max-cells "${MAX_CELLS}" \
   --max-expr-features "${MAX_EXPR_FEATURES}" \
   --max-splicing-features "${MAX_SPLICING_FEATURES}"
@@ -35,7 +39,9 @@ python scripts/build_splicevi_mudata.py \
 echo "Validating SpliceVI Mudata object..."
 
 python scripts/validate_splicevi_mudata.py \
-  --h5mu data/processed/splicevi_custom_input.h5mu
+  --h5mu data/processed/splicevi_custom_input.h5mu \
+  --atse-grouping-mode "${ATSE_GROUPING_MODE}" \
+  --mask-atse-threshold "${MASK_ATSE_THRESHOLD}"
 
 echo "Starting training..."
 

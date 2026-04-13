@@ -78,6 +78,8 @@ python scripts/build_splicevi_mudata.py \
   --metadata-csvs data/MO_sample_metadata.csv data/VIS_sample_metadata.csv \
   --expr-group-map data/MO_VIS_core.individual2group.expr.conf \
   --as-group-map data/MO_VIS_core.individual2group.as.conf \
+  --atse-grouping-mode both_anchors \
+  --mask-atse-threshold 0 \
   --output-h5mu data/processed/splicevi_custom_input.h5mu
 ```
 
@@ -91,7 +93,9 @@ For a quick smoke test on a subset, add:
 
 ```bash
 python scripts/validate_splicevi_mudata.py \
-  --h5mu data/processed/splicevi_custom_input.h5mu
+  --h5mu data/processed/splicevi_custom_input.h5mu \
+  --atse-grouping-mode both_anchors \
+  --mask-atse-threshold 0
 ```
 
 3. Train using the generated file:
@@ -161,14 +165,27 @@ The builder writes a `.h5mu` with:
 - `splicing.var['event_id']` (ATSE grouping)
 - `obs['donor_id']`
 
-### Notes on Pseudo-counts
+### Notes on Splicing Layer Construction
 
-If raw splicing count matrices are not available, the builder derives pseudo junction
-counts from PSI values using `--pseudo-depth` and then computes ATSE totals by summing
-junction pseudo-counts within each `event_id` group.
+The builder derives required splicing layers directly from the event IDs in
+`MO_VIS_core.individual.cass.mat.txt`:
 
-This enables training with ratio-only splicing inputs, but raw-count-based layers are
-preferred when available.
+- Each event row is expanded into two junction features:
+  - upstream junction `(upstream_end, cassette_start)`
+  - downstream junction `(cassette_end, downstream_start)`
+- Junction counts are inferred from event support fields in `[inc/exc]` and PSI:
+  - upstream count per cell: `round(PSI * inc_support)`
+  - downstream count per cell: `round(PSI * exc_support)`
+- ATSE counts are computed by summing junction counts within grouping key
+  `splicing.var['event_id']`, controlled by `--atse-grouping-mode`:
+  - `both_anchors` (default)
+  - `upstream_only`
+  - `downstream_only`
+- Binary mask is derived from ATSE counts (not PSI missingness):
+  - `psi_mask = 1` when `ATSE_count > --mask-atse-threshold`
+  - `psi_mask = 0` otherwise
+
+This is now the default and only supported count/mask construction mode.
 
 Future additions:
 - [ ] Add `tutorial.ipynb` for a walkthrough of model setup, training, and application to other datasets.
