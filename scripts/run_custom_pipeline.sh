@@ -19,7 +19,7 @@ conda activate "${ENV_NAME}"
 
 mkdir -p data/processed models logs
 
-echo "Building SpliceVI MuData object with max_cells=${MAX_CELLS}, max_expr_features=${MAX_EXPR_FEATURES}, max_splicing_features=${MAX_SPLICING_FEATURES}..."
+echo "Building SpliceVI Mudata object from input tables..."
 
 python scripts/build_splicevi_mudata.py \
   --expr-matrix data/Tasic2018_MO_VIS_core.individual.expr.mat.txt \
@@ -32,15 +32,17 @@ python scripts/build_splicevi_mudata.py \
   --max-expr-features "${MAX_EXPR_FEATURES}" \
   --max-splicing-features "${MAX_SPLICING_FEATURES}"
 
-echo "Validating SpliceVI MuData object schema compatibility..."
+echo "Validating SpliceVI Mudata object..."
 
 python scripts/validate_splicevi_mudata.py \
   --h5mu data/processed/splicevi_custom_input.h5mu
 
-echo "Starting SpliceVI training with custom data..."
+echo "Starting training..."
 
 python train_splicevi.py \
   --train_mdata_path data/processed/splicevi_custom_input.h5mu \
   --model_dir models/custom_baseline_$(date +"%Y%m%d_%H%M%S") \
   --batch_key None \
   --max_epochs 1 # Just 1 epoch for testing; increase for real training
+
+echo "Pipeline complete. Check model directory for outputs."

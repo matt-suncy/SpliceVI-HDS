@@ -109,6 +109,42 @@ One-command helper:
 bash scripts/run_custom_pipeline.sh
 ```
 
+## Retrained Model Evaluation (Smoke -> Full)
+
+Use the staged evaluator to run a fast compatibility check first, then a full evaluation sweep with the same model and data wiring.
+
+Smoke run (recommended first):
+
+```bash
+bash scripts/run_staged_eval.sh \
+  --mode smoke \
+  --model-dir models/custom_baseline_run \
+  --train-h5mu data/processed/train_splicevi_input.h5mu \
+  --test-h5mu data/processed/test_splicevi_input.h5mu \
+  --masked-h5mu data/processed/test_masked_25.h5mu \
+  --masked-resampled
+```
+
+Full run (after smoke passes):
+
+```bash
+bash scripts/run_staged_eval.sh \
+  --mode full \
+  --model-dir models/custom_baseline_run \
+  --train-h5mu data/processed/train_splicevi_input.h5mu \
+  --test-h5mu data/processed/test_splicevi_input.h5mu \
+  --masked-h5mu data/processed/test_masked_25.h5mu \
+  --masked-h5mu data/processed/test_masked_50.h5mu \
+  --masked-resampled
+```
+
+What this runner does:
+
+- Validates both train/test `.h5mu` files with `scripts/validate_splicevi_mudata.py` before evaluation.
+- In `smoke` mode, runs `masked_impute` if masked files are provided; otherwise falls back to `test_eval`.
+- In `full` mode, runs `umap`, `clustering`, `train_eval`, `test_eval`, `cross_fold_classification`, `age_r2_heatmap`, and optionally `masked_impute`.
+- Writes run artifacts to `logs/eval_runs/eval_<mode>_<model>_<timestamp>/` including `eval.log` and `launch_command.sh` for reproducibility.
+
 ### Required Output Schema for `train_splicevi.py`
 
 The builder writes a `.h5mu` with:

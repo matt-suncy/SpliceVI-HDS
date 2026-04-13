@@ -20,7 +20,8 @@ REQUIRED_SPLICE_LAYERS = [
 
 
 def validate(path: Path) -> None:
-    mdata = mu.read_h5mu(path)
+    # Backed mode keeps validation lightweight for large .h5mu files.
+    mdata = mu.read_h5mu(path, backed="r")
 
     if "rna" not in mdata.mod or "splicing" not in mdata.mod:
         raise ValueError("MuData must contain modalities 'rna' and 'splicing'.")

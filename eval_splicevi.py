@@ -195,6 +195,34 @@ CROSS_FOLD_CLASS_RECORDS = []
 MIN_GROUP_N = 25  # minimum cells per tissue | celltype group
 
 
+def _safe_silhouette_score(
+    Z: np.ndarray,
+    labels: np.ndarray,
+    label_name: str,
+    split_name: str,
+    latent_name: str,
+) -> Optional[float]:
+    """Return silhouette score only when sklearn validity constraints are met."""
+    n_samples = int(len(labels))
+    n_unique = int(pd.Series(labels).nunique(dropna=False))
+
+    if n_samples < 3:
+        print(
+            f"[EVAL/{split_name}-{latent_name}] Skipping silhouette ({label_name}): "
+            f"need >=3 samples, got {n_samples}."
+        )
+        return None
+
+    if n_unique < 2 or n_unique >= n_samples:
+        print(
+            f"[EVAL/{split_name}-{latent_name}] Skipping silhouette ({label_name}): "
+            f"need 2..n-1 unique labels, got {n_unique} for n={n_samples}."
+        )
+        return None
+
+    return float(silhouette_score(Z, labels))
+
+
 def evaluate_split(
     name: str,
     mdata,
@@ -236,25 +264,51 @@ def evaluate_split(
             }
         )
 
-    # Silhouette scores
+    # Silhouette scores (resolve keys on this split and guard invalid label cardinality)
     print(f"[EVAL/{name}-{Z_type}] Computing silhouette scores...")
-    labels_broad = mdata.obs[umap_color_key].astype(str).values
-    sil_broad = silhouette_score(Z, labels_broad)
-    labels_med = mdata.obs[cell_type_classification_key].astype(str).values
-    sil_med = silhouette_score(Z, labels_med)
+    obs_cols = [c for c in mdata.obs.columns if not str(c).startswith("_")]
+    fallback_key = obs_cols[0] if obs_cols else None
 
-    print(f"[EVAL/{name}-{Z_type}] Silhouette ({umap_color_key}): {sil_broad:.4f}")
-    print(
-        f"[EVAL/{name}-{Z_type}] Silhouette ({cell_type_classification_key}): {sil_med:.4f}"
+    broad_key = umap_color_key if umap_color_key in mdata.obs.columns else fallback_key
+    med_key = (
+        cell_type_classification_key
+        if cell_type_classification_key in mdata.obs.columns
+        else broad_key
     )
 
-    if wandb is not None:
-        wandb.log(
-            {
-                f"real-{name}-{Z_type}/{umap_color_key}-silhouette_score": sil_broad,
-                f"real-{name}-{Z_type}/{cell_type_classification_key}-silhouette_score": sil_med,
-            }
+    if broad_key is None:
+        print(
+            f"[EVAL/{name}-{Z_type}] No usable obs columns found; skipping silhouette and LR classification."
         )
+        return
+
+    if broad_key != umap_color_key:
+        print(
+            f"[EVAL/{name}-{Z_type}] '{umap_color_key}' missing; using '{broad_key}' instead."
+        )
+    if med_key != cell_type_classification_key:
+        print(
+            f"[EVAL/{name}-{Z_type}] '{cell_type_classification_key}' missing; using '{med_key}' instead."
+        )
+
+    labels_broad = mdata.obs[broad_key].astype(str).values
+    sil_broad = _safe_silhouette_score(Z, labels_broad, broad_key, name, Z_type)
+    labels_med = mdata.obs[med_key].astype(str).values
+    sil_med = _safe_silhouette_score(Z, labels_med, med_key, name, Z_type)
+
+    if sil_broad is not None:
+        print(f"[EVAL/{name}-{Z_type}] Silhouette ({broad_key}): {sil_broad:.4f}")
+    if sil_med is not None:
+        print(f"[EVAL/{name}-{Z_type}] Silhouette ({med_key}): {sil_med:.4f}")
+
+    if wandb is not None:
+        metrics = {}
+        if sil_broad is not None:
+            metrics[f"real-{name}-{Z_type}/{broad_key}-silhouette_score"] = sil_broad
+        if sil_med is not None:
+            metrics[f"real-{name}-{Z_type}/{med_key}-silhouette_score"] = sil_med
+        if metrics:
+            wandb.log(metrics)
 
     # LR classification on medium cell type
     print(f"[EVAL/{name}-{Z_type}] Training logistic regression classifier...")
@@ -1026,10 +1080,22 @@ def main():
         wandb.log({"total_parameters": total_params})
 
     # Decide classification and UMAP default keys now that TRAIN obs is available
-    umap_color_key = "broad_cell_type" if "broad_cell_type" in mdata_train.obs.columns else "tissue"
+    # Defensive: ensure cell type key selection always finds a valid column
+    umap_color_key = None
+    for candidate in ["broad_cell_type", "tissue", "class", "subclass", "cluster", "cell_type"]:
+        if candidate in mdata_train.obs.columns and mdata_train.obs[candidate].notna().any():
+            umap_color_key = candidate
+            break
+    if umap_color_key is None:
+        # Last resort: use first available obs column
+        for col in mdata_train.obs.columns:
+            if mdata_train.obs[col].notna().any():
+                umap_color_key = col
+                break
+
     cell_type_classification_key = (
         "medium_cell_type"
-        if "medium_cell_type" in mdata_train.obs.columns
+        if "medium_cell_type" in mdata_train.obs.columns and mdata_train.obs["medium_cell_type"].notna().any()
         else umap_color_key
     )
 
@@ -1199,311 +1265,326 @@ def main():
         if "medium_cell_type" in mdata_train["rna"].obs:
             cell_type_col = "medium_cell_type"
 
-        def run_leiden_on_basis(ad, basis_key: str, neigh_key: str, leiden_key: str):
-            sc.pp.neighbors(ad, use_rep=basis_key, key_added=neigh_key)
-            sc.tl.leiden(
-                ad,
-                neighbors_key=neigh_key,
-                key_added=leiden_key,
-                resolution=LEIDEN_RESOLUTION,
-            )
+        # Defensive: check if cell_type_col exists and has data
+        if cell_type_col not in mdata_train["rna"].obs.columns or mdata_train["rna"].obs[cell_type_col].isna().all():
+            for candidate in ["class", "subclass", "cluster", "cell_type"]:
+                if candidate in mdata_train["rna"].obs.columns and mdata_train["rna"].obs[candidate].notna().any():
+                    cell_type_col = candidate
+                    print(f"[EVAL/CLUSTER] Using fallback cell_type_col: '{cell_type_col}'")
+                    break
+            else:
+                cell_type_col = None
 
-        excl_multi_records = []
-        spaces_order = ["expression", "splicing", "joint"]
-        leiden_keys = {}
+        if cell_type_col is not None:
 
-        print("[EVAL/CLUSTER] Running Leiden clustering per latent space...")
-        for name in ["joint", "expression", "splicing"]:
-            basis_key = f"X_latent_{name}"
-            neigh_key = f"neighbors_{name}_leiden"
-            leiden_key = f"leiden_{name}"
+            def run_leiden_on_basis(ad, basis_key: str, neigh_key: str, leiden_key: str):
+                sc.pp.neighbors(ad, use_rep=basis_key, key_added=neigh_key)
+                sc.tl.leiden(
+                    ad,
+                    neighbors_key=neigh_key,
+                    key_added=leiden_key,
+                    resolution=LEIDEN_RESOLUTION,
+                )
 
-            print(f"[EVAL/CLUSTER] Clustering in space '{name}'...")
-            run_leiden_on_basis(mdata_train["rna"], basis_key, neigh_key, leiden_key)
-            leiden_keys[name] = leiden_key
+            excl_multi_records = []
+            spaces_order = ["expression", "splicing", "joint"]
+            leiden_keys = {}
 
-            n_cl = int(mdata_train["rna"].obs[leiden_key].nunique())
-            print(f"[EVAL/CLUSTER] '{name}' produced {n_cl} clusters.")
-            if run is not None:
-                wandb.log({f"clustering/{name}_leiden_n_clusters": n_cl})
+            print("[EVAL/CLUSTER] Running Leiden clustering per latent space...")
+            for name in ["joint", "expression", "splicing"]:
+                basis_key = f"X_latent_{name}"
+                neigh_key = f"neighbors_{name}_leiden"
+                leiden_key = f"leiden_{name}"
 
-            cts_per_cluster = (
-                mdata_train["rna"]
-                .obs.groupby(leiden_key)[cell_type_col]
-                .apply(lambda s: set(s.astype(str).values))
-            )
-            n_unique = sum(1 for s in cts_per_cluster.values if len(s) == 1)
-            n_multi = sum(1 for s in cts_per_cluster.values if len(s) > 1)
+                print(f"[EVAL/CLUSTER] Clustering in space '{name}'...")
+                run_leiden_on_basis(mdata_train["rna"], basis_key, neigh_key, leiden_key)
+                leiden_keys[name] = leiden_key
 
-            print(
-                f"[EVAL/CLUSTER] '{name}': {n_unique} clusters map to a single cell type, {n_multi} span multiple types."
-            )
+                n_cl = int(mdata_train["rna"].obs[leiden_key].nunique())
+                print(f"[EVAL/CLUSTER] '{name}' produced {n_cl} clusters.")
+                if run is not None:
+                    wandb.log({f"clustering/{name}_leiden_n_clusters": n_cl})
 
-            if run is not None:
-                wandb.log(
+                cts_per_cluster = (
+                    mdata_train["rna"]
+                    .obs.groupby(leiden_key)[cell_type_col]
+                    .apply(lambda s: set(s.astype(str).values))
+                )
+                n_unique = sum(1 for s in cts_per_cluster.values if len(s) == 1)
+                n_multi = sum(1 for s in cts_per_cluster.values if len(s) > 1)
+
+                print(
+                    f"[EVAL/CLUSTER] '{name}': {n_unique} clusters map to a single cell type, {n_multi} span multiple types."
+                )
+
+                if run is not None:
+                    wandb.log(
+                        {
+                            f"clusters/{name}_n_unique_one_celltype": int(n_unique),
+                            f"clusters/{name}_n_multi_celltypes": int(n_multi),
+                        }
+                    )
+
+                excl_multi_records.append(
                     {
-                        f"clusters/{name}_n_unique_one_celltype": int(n_unique),
-                        f"clusters/{name}_n_multi_celltypes": int(n_multi),
+                        "space": name,
+                        "category": "Unique to one cell type",
+                        "count": int(n_unique),
+                    }
+                )
+                excl_multi_records.append(
+                    {
+                        "space": name,
+                        "category": "Multiple cell types",
+                        "count": int(n_multi),
                     }
                 )
 
-            excl_multi_records.append(
-                {
-                    "space": name,
-                    "category": "Unique to one cell type",
-                    "count": int(n_unique),
-                }
+                # Plot joint UMAP colored by Leiden labels for each space
+                plt.figure(figsize=(8, 6))
+                sc.pl.embedding(
+                    mdata_train["rna"],
+                    basis="X_umap_joint",
+                    color=leiden_key,
+                    legend_loc=None,
+                    frameon=True,
+                    show=False,
+                )
+                plt.title(f"TRAIN joint UMAP colored by Leiden ({name})")
+                plt.tight_layout()
+                out_path = (
+                    f"{args.fig_dir}/train_umap_joint_colored_by_{name}_leiden.png"
+                )
+                plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                print(f"[EVAL/CLUSTER] Saved cluster UMAP: {out_path}")
+                if run is not None:
+                    wandb.log(
+                        {
+                            f"clustering/train_umap_joint_colored_by_{name}_leiden": wandb.Image(
+                                out_path
+                            )
+                        }
+                    )
+                plt.close()
+
+            # Bar plot: subclusters per cell type
+            print("[EVAL/CLUSTER] Building bar plot: subclusters per top-20 cell types...")
+            cell_type_for_bars = cell_type_col
+            obs = mdata_train["rna"].obs
+            ct_counts = obs[cell_type_for_bars].value_counts()
+            top20_cts = ct_counts.head(20).index.tolist()
+            print(f"[EVAL/CLUSTER] Top 20 cell types: {top20_cts}")
+
+            records_sub = []
+            for space_name, leiden_key in leiden_keys.items():
+                sub_df = (
+                    obs.loc[obs[cell_type_for_bars].isin(top20_cts), [cell_type_for_bars, leiden_key]]
+                    .groupby(cell_type_for_bars)[leiden_key]
+                    .nunique()
+                    .rename("n_subclusters")
+                    .reset_index()
+                )
+                sub_df["space"] = space_name
+                records_sub.append(sub_df)
+
+            sub_all = pd.concat(records_sub, ignore_index=True)
+            sub_all["space"] = pd.Categorical(
+                sub_all["space"], categories=spaces_order, ordered=True
             )
-            excl_multi_records.append(
-                {
-                    "space": name,
-                    "category": "Multiple cell types",
-                    "count": int(n_multi),
-                }
+            sub_all[cell_type_for_bars] = pd.Categorical(
+                sub_all[cell_type_for_bars], categories=top20_cts, ordered=True
             )
 
-            # Plot joint UMAP colored by Leiden labels for each space
-            plt.figure(figsize=(8, 6))
-            sc.pl.embedding(
-                mdata_train["rna"],
-                basis="X_umap_joint",
-                color=leiden_key,
-                legend_loc=None,
-                frameon=True,
-                show=False,
+            plt.figure(figsize=(max(12, 0.6 * len(top20_cts)), 6))
+            sns.barplot(
+                data=sub_all.sort_values([cell_type_for_bars, "space"]),
+                x=cell_type_for_bars,
+                y="n_subclusters",
+                hue="space",
             )
-            plt.title(f"TRAIN joint UMAP colored by Leiden ({name})")
+            plt.xticks(rotation=45, ha="right")
+            plt.xlabel(cell_type_for_bars)
+            plt.ylabel("Number of Leiden sub-clusters")
+            plt.title(
+                f"TRAIN sub-clusters per cell type (top 20, res={LEIDEN_RESOLUTION})"
+            )
+            plt.tight_layout()
+            out_path = f"{args.fig_dir}/train_bar_subclusters_top20_{cell_type_for_bars}_leiden_res_{LEIDEN_RESOLUTION}.png"
+            plt.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"[EVAL/CLUSTER] Saved bar plot of subclusters: {out_path}")
+            if run is not None:
+                wandb.log({"clustering/train_bar_subclusters_top20": wandb.Image(out_path)})
+            plt.close()
+
+            # Cluster exclusivity plot
+            ex_df = pd.DataFrame(excl_multi_records)
+            ex_df["space"] = pd.Categorical(
+                ex_df["space"], categories=spaces_order, ordered=True
+            )
+            ex_df["category"] = pd.Categorical(
+                ex_df["category"],
+                categories=["Unique to one cell type", "Multiple cell types"],
+                ordered=True,
+            )
+
+            plt.figure(figsize=(8, 5))
+            sns.barplot(data=ex_df, x="category", y="count", hue="space")
+            plt.xlabel("")
+            plt.ylabel("Number of Leiden clusters")
+            plt.title("TRAIN cluster exclusivity across spaces")
             plt.tight_layout()
             out_path = (
-                f"{args.fig_dir}/train_umap_joint_colored_by_{name}_leiden.png"
+                f"{args.fig_dir}/train_clusters_exclusive_vs_multi_by_space.png"
             )
             plt.savefig(out_path, dpi=300, bbox_inches="tight")
-            print(f"[EVAL/CLUSTER] Saved cluster UMAP: {out_path}")
+            print(f"[EVAL/CLUSTER] Saved exclusivity plot: {out_path}")
             if run is not None:
                 wandb.log(
                     {
-                        f"clustering/train_umap_joint_colored_by_{name}_leiden": wandb.Image(
+                        "clustering/train_clusters_exclusive_vs_multi_by_space": wandb.Image(
                             out_path
                         )
                     }
                 )
             plt.close()
 
-        # Bar plot: subclusters per cell type
-        print("[EVAL/CLUSTER] Building bar plot: subclusters per top-20 cell types...")
-        cell_type_for_bars = cell_type_col
-        obs = mdata_train["rna"].obs
-        ct_counts = obs[cell_type_for_bars].value_counts()
-        top20_cts = ct_counts.head(20).index.tolist()
-        print(f"[EVAL/CLUSTER] Top 20 cell types: {top20_cts}")
+            # Pairwise same-cluster consistency
+            print("[EVAL/CLUSTER] Computing pairwise same-cluster consistency...")
+            pairs = [("expression", "joint"), ("splicing", "joint"), ("expression", "splicing")]
 
-        records_sub = []
-        for space_name, leiden_key in leiden_keys.items():
-            sub_df = (
-                obs.loc[obs[cell_type_for_bars].isin(top20_cts), [cell_type_for_bars, leiden_key]]
-                .groupby(cell_type_for_bars)[leiden_key]
-                .nunique()
-                .rename("n_subclusters")
-                .reset_index()
-            )
-            sub_df["space"] = space_name
-            records_sub.append(sub_df)
+            n_cells = mdata_train["rna"].n_obs
+            idx_all = np.arange(n_cells, dtype=np.int32)
 
-        sub_all = pd.concat(records_sub, ignore_index=True)
-        sub_all["space"] = pd.Categorical(
-            sub_all["space"], categories=spaces_order, ordered=True
-        )
-        sub_all[cell_type_for_bars] = pd.Categorical(
-            sub_all[cell_type_for_bars], categories=top20_cts, ordered=True
-        )
+            cluster_members = {}
+            for name in ["joint", "expression", "splicing"]:
+                labs = mdata_train["rna"].obs[leiden_keys[name]].values
+                members = {}
+                for cid, grp in pd.Series(idx_all).groupby(labs):
+                    members[cid] = grp.values.astype(np.int32, copy=False)
+                cluster_members[name] = (labs, members)
 
-        plt.figure(figsize=(max(12, 0.6 * len(top20_cts)), 6))
-        sns.barplot(
-            data=sub_all.sort_values([cell_type_for_bars, "space"]),
-            x=cell_type_for_bars,
-            y="n_subclusters",
-            hue="space",
-        )
-        plt.xticks(rotation=45, ha="right")
-        plt.xlabel(cell_type_for_bars)
-        plt.ylabel("Number of Leiden sub-clusters")
-        plt.title(
-            f"TRAIN sub-clusters per cell type (top 20, res={LEIDEN_RESOLUTION})"
-        )
-        plt.tight_layout()
-        out_path = f"{args.fig_dir}/train_bar_subclusters_top20_{cell_type_for_bars}_leiden_res_{LEIDEN_RESOLUTION}.png"
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"[EVAL/CLUSTER] Saved bar plot of subclusters: {out_path}")
-        if run is not None:
-            wandb.log({"clustering/train_bar_subclusters_top20": wandb.Image(out_path)})
-        plt.close()
+            heat_records = []
+            for a, b in pairs:
+                print(f"[EVAL/CLUSTER] Computing consistency for {a} vs {b}...")
+                labs_a, mem_a = cluster_members[a]
+                labs_b, mem_b = cluster_members[b]
 
-        # Cluster exclusivity plot
-        ex_df = pd.DataFrame(excl_multi_records)
-        ex_df["space"] = pd.Categorical(
-            ex_df["space"], categories=spaces_order, ordered=True
-        )
-        ex_df["category"] = pd.Categorical(
-            ex_df["category"],
-            categories=["Unique to one cell type", "Multiple cell types"],
-            ordered=True,
-        )
+                overlap = np.empty(n_cells, dtype=np.float32)
+                for i in range(n_cells):
+                    ca = labs_a[i]
+                    cb = labs_b[i]
+                    Sa = mem_a[ca]
+                    Sb = mem_b[cb]
+                    if Sa.size <= 1:
+                        overlap[i] = np.nan
+                        continue
+                    Sa_no_i = Sa[Sa != i]
+                    inter_sz = len(set(Sa_no_i).intersection(Sb))
+                    overlap[i] = inter_sz / float(Sa_no_i.size)
 
-        plt.figure(figsize=(8, 5))
-        sns.barplot(data=ex_df, x="category", y="count", hue="space")
-        plt.xlabel("")
-        plt.ylabel("Number of Leiden clusters")
-        plt.title("TRAIN cluster exclusivity across spaces")
-        plt.tight_layout()
-        out_path = (
-            f"{args.fig_dir}/train_clusters_exclusive_vs_multi_by_space.png"
-        )
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"[EVAL/CLUSTER] Saved exclusivity plot: {out_path}")
-        if run is not None:
-            wandb.log(
-                {
-                    "clustering/train_clusters_exclusive_vs_multi_by_space": wandb.Image(
-                        out_path
-                    )
-                }
-            )
-        plt.close()
+                key_cell = f"samecluster_overlap_{a}_vs_{b}"
+                mdata_train["rna"].obs[key_cell] = overlap
 
-        # Pairwise same-cluster consistency
-        print("[EVAL/CLUSTER] Computing pairwise same-cluster consistency...")
-        pairs = [("expression", "joint"), ("splicing", "joint"), ("expression", "splicing")]
-
-        n_cells = mdata_train["rna"].n_obs
-        idx_all = np.arange(n_cells, dtype=np.int32)
-
-        cluster_members = {}
-        for name in ["joint", "expression", "splicing"]:
-            labs = mdata_train["rna"].obs[leiden_keys[name]].values
-            members = {}
-            for cid, grp in pd.Series(idx_all).groupby(labs):
-                members[cid] = grp.values.astype(np.int32, copy=False)
-            cluster_members[name] = (labs, members)
-
-        heat_records = []
-        for a, b in pairs:
-            print(f"[EVAL/CLUSTER] Computing consistency for {a} vs {b}...")
-            labs_a, mem_a = cluster_members[a]
-            labs_b, mem_b = cluster_members[b]
-
-            overlap = np.empty(n_cells, dtype=np.float32)
-            for i in range(n_cells):
-                ca = labs_a[i]
-                cb = labs_b[i]
-                Sa = mem_a[ca]
-                Sb = mem_b[cb]
-                if Sa.size <= 1:
-                    overlap[i] = np.nan
-                    continue
-                Sa_no_i = Sa[Sa != i]
-                inter_sz = len(set(Sa_no_i).intersection(Sb))
-                overlap[i] = inter_sz / float(Sa_no_i.size)
-
-            key_cell = f"samecluster_overlap_{a}_vs_{b}"
-            mdata_train["rna"].obs[key_cell] = overlap
-
-            mean_ov = float(np.nanmean(overlap))
-            median_ov = float(np.nanmedian(overlap))
-            print(
-                f"[EVAL/CLUSTER] {a} vs {b} mean overlap: {mean_ov:.4f}, median: {median_ov:.4f}"
-            )
-            if run is not None:
-                wandb.log(
-                    {
-                        f"clustering/{a}_vs_{b}_samecluster_mean": mean_ov,
-                        f"clustering/{a}_vs_{b}_samecluster_median": median_ov,
-                    }
+                mean_ov = float(np.nanmean(overlap))
+                median_ov = float(np.nanmedian(overlap))
+                print(
+                    f"[EVAL/CLUSTER] {a} vs {b} mean overlap: {mean_ov:.4f}, median: {median_ov:.4f}"
                 )
+                if run is not None:
+                    wandb.log(
+                        {
+                            f"clustering/{a}_vs_{b}_samecluster_mean": mean_ov,
+                            f"clustering/{a}_vs_{b}_samecluster_median": median_ov,
+                        }
+                    )
 
-            if "tissue" in mdata_train["rna"].obs:
-                pair_label = (
-                    mdata_train["rna"]
-                    .obs["tissue"]
-                    .astype("string")
-                    .fillna("NA")
-                    .str.cat(
+                if "tissue" in mdata_train["rna"].obs:
+                    pair_label = (
+                        mdata_train["rna"]
+                        .obs["tissue"]
+                        .astype("string")
+                        .fillna("NA")
+                        .str.cat(
+                            mdata_train["rna"]
+                            .obs[cell_type_col]
+                            .astype("string")
+                            .fillna("NA"),
+                            sep=" | ",
+                        )
+                        .to_numpy()
+                    )
+                else:
+                    pair_label = (
                         mdata_train["rna"]
                         .obs[cell_type_col]
                         .astype("string")
-                        .fillna("NA"),
-                        sep=" | ",
+                        .fillna("NA")
+                        .to_numpy()
                     )
-                    .to_numpy()
+
+                df_tmp = (
+                    pd.DataFrame({"pair_label": pair_label, "overlap": overlap})
+                    .groupby("pair_label", as_index=False)["overlap"]
+                    .mean()
                 )
-            else:
-                pair_label = (
-                    mdata_train["rna"]
-                    .obs[cell_type_col]
-                    .astype("string")
-                    .fillna("NA")
-                    .to_numpy()
+                df_tmp["pct_consistent"] = df_tmp["overlap"].fillna(0.0) * 100.0
+                df_tmp["pair"] = f"{a}_vs_{b}"
+                heat_records.append(
+                    df_tmp[["pair_label", "pair", "pct_consistent"]]
                 )
 
-            df_tmp = (
-                pd.DataFrame({"pair_label": pair_label, "overlap": overlap})
-                .groupby("pair_label", as_index=False)["overlap"]
-                .mean()
-            )
-            df_tmp["pct_consistent"] = df_tmp["overlap"].fillna(0.0) * 100.0
-            df_tmp["pair"] = f"{a}_vs_{b}"
-            heat_records.append(
-                df_tmp[["pair_label", "pair", "pct_consistent"]]
-            )
+            heat_df = pd.concat(heat_records, ignore_index=True)
+            heat_pivot = heat_df.pivot(
+                index="pair_label", columns="pair", values="pct_consistent"
+            ).fillna(0.0)
 
-        heat_df = pd.concat(heat_records, ignore_index=True)
-        heat_pivot = heat_df.pivot(
-            index="pair_label", columns="pair", values="pct_consistent"
-        ).fillna(0.0)
-
-        print("[EVAL/CLUSTER] Plotting clustermap of percent consistent clusters...")
-        plt.close("all")
-        g = sns.clustermap(
-            heat_pivot,
-            cmap="viridis",
-            vmin=0.0,
-            vmax=100.0,
-            metric="euclidean",
-            method="average",
-            figsize=(
-                max(6, 0.25 * heat_pivot.shape[1] + 4),
-                max(6, 0.30 * heat_pivot.shape[0] + 3),
-            ),
-            row_cluster=True,
-            col_cluster=False,
-            annot=False,
-        )
-        g.figure.suptitle(
-            f"TRAIN percent consistent by tissue | cell type (Leiden, res={LEIDEN_RESOLUTION})",
-            y=1.02,
-            fontsize=12,
-        )
-        out_path = f"{args.fig_dir}/train_clustermap_pct_consistent_leiden_res_{LEIDEN_RESOLUTION}.png"
-        g.figure.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"[EVAL/CLUSTER] Saved clustermap: {out_path}")
-        if run is not None:
-            wandb.log(
-                {"clustering/train_clustermap_pct_consistent": wandb.Image(out_path)}
+            print("[EVAL/CLUSTER] Plotting clustermap of percent consistent clusters...")
+            plt.close("all")
+            g = sns.clustermap(
+                heat_pivot,
+                cmap="viridis",
+                vmin=0.0,
+                vmax=100.0,
+                metric="euclidean",
+                method="average",
+                figsize=(
+                    max(6, 0.25 * heat_pivot.shape[1] + 4),
+                    max(6, 0.30 * heat_pivot.shape[0] + 3),
+                ),
+                row_cluster=True,
+                col_cluster=False,
+                annot=False,
             )
-        plt.close(g.figure)
-
-        # AMI
-        print("[EVAL/CLUSTER] Computing adjusted mutual information between clusterings...")
-        for a, b in pairs:
-            ami = adjusted_mutual_info_score(
-                mdata_train["rna"].obs[leiden_keys[a]].values,
-                mdata_train["rna"].obs[leiden_keys[b]].values,
+            g.figure.suptitle(
+                f"TRAIN percent consistent by tissue | cell type (Leiden, res={LEIDEN_RESOLUTION})",
+                y=1.02,
+                fontsize=12,
             )
-            print(f"[EVAL/CLUSTER] AMI {a} vs {b}: {ami:.4f}")
+            out_path = f"{args.fig_dir}/train_clustermap_pct_consistent_leiden_res_{LEIDEN_RESOLUTION}.png"
+            g.figure.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"[EVAL/CLUSTER] Saved clustermap: {out_path}")
             if run is not None:
-                wandb.log({f"clustering/{a}_vs_{b}_AMI": float(ami)})
+                wandb.log(
+                    {"clustering/train_clustermap_pct_consistent": wandb.Image(out_path)}
+                )
+            plt.close(g.figure)
 
-        del heat_records, heat_pivot, heat_df
-        gc.collect()
+            # AMI
+            print("[EVAL/CLUSTER] Computing adjusted mutual information between clusterings...")
+            for a, b in pairs:
+                ami = adjusted_mutual_info_score(
+                    mdata_train["rna"].obs[leiden_keys[a]].values,
+                    mdata_train["rna"].obs[leiden_keys[b]].values,
+                )
+                print(f"[EVAL/CLUSTER] AMI {a} vs {b}: {ami:.4f}")
+                if run is not None:
+                    wandb.log({f"clustering/{a}_vs_{b}_AMI": float(ami)})
+
+            del heat_records, heat_pivot, heat_df
+            gc.collect()
+        else:
+            print("[EVAL/CLUSTER] Clustering skipped - no suitable cell type column found.")
+
     else:
         print("[EVAL/CLUSTER] Clustering evaluation skipped by config.")
 
