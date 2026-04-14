@@ -18,6 +18,64 @@ from .partialvae import PartialEncoderEDDIFaster, LinearDecoder, group_logsumexp
 
 
 
+# ---------------------------------------------------------------------------
+# Latent combination modules
+# ---------------------------------------------------------------------------
+_SAMPLE_BASED_MIXERS = {"sum", "product", "gating", "cross_attention", "mlp"}
+
+
+class SumMixer(nn.Module):
+    """Elementwise sum of two latent vectors."""
+    def forward(self, z_as, z_ge): return z_as + z_ge
+
+
+class ProductMixer(nn.Module):
+    """Elementwise product of two latent vectors."""
+    def forward(self, z_as, z_ge): return z_as * z_ge
+
+
+class GatingMixer(nn.Module):
+    """Sigmoid gate learned from concatenation of both latents; dimension-wise blend."""
+    def __init__(self, n_latent):
+        super().__init__()
+        self.gate = nn.Linear(2 * n_latent, n_latent)
+
+    def forward(self, z_as, z_ge):
+        g = torch.sigmoid(self.gate(torch.cat([z_as, z_ge], dim=-1)))
+        return g * z_as + (1 - g) * z_ge
+
+
+class CrossAttentionMixer(nn.Module):
+    """Per-dim token attention: each latent dim is a token; z_as (AS) queries z_ge (GE)."""
+    def __init__(self, n_latent):
+        super().__init__()
+        # embed_dim=1: each token is a scalar (one latent dimension)
+        self.attn = nn.MultiheadAttention(embed_dim=1, num_heads=1, batch_first=True)
+
+    def forward(self, z_as, z_ge):
+        # (B, Z) -> (B, Z, 1): treat each latent dim as a token of size 1
+        Q = z_as.unsqueeze(-1)  # (B, Z, 1)
+        K = z_ge.unsqueeze(-1)
+        V = z_ge.unsqueeze(-1)
+        out, _ = self.attn(Q, K, V)  # (B, Z, 1)
+        return out.squeeze(-1)       # (B, Z)
+
+
+class MLPMixer(nn.Module):
+    """Concatenate both latents, pass through a two-layer MLP, project back to n_latent."""
+    def __init__(self, n_latent, n_hidden=None):
+        super().__init__()
+        n_hidden = n_hidden or n_latent * 2
+        self.net = nn.Sequential(
+            nn.Linear(2 * n_latent, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_latent),
+        )
+
+    def forward(self, z_as, z_ge):
+        return self.net(torch.cat([z_as, z_ge], dim=-1))
+
+
 class LibrarySizeEncoder(torch.nn.Module):
     """Library size encoder for gene expression.
 
@@ -464,11 +522,29 @@ class SPLICEVAE(BaseModuleClass):
             self.register_buffer("mod_weights", torch.ones(max_n_modalities))
         elif modality_weights == "universal":
             self.mod_weights = torch.nn.Parameter(torch.ones(max_n_modalities))
+        elif modality_weights in _SAMPLE_BASED_MIXERS:
+            # new mixers don't use mod_weights; register a small buffer to avoid a
+            # large unused per-cell parameter
+            self.register_buffer("mod_weights", torch.ones(max_n_modalities))
         else:
             self.mod_weights = torch.nn.Parameter(torch.ones(n_obs, max_n_modalities))
-        
+
         # gate that controls how much of the "other" half a decoder can see (0=off, 1=on)
         self.register_buffer("cross_gate", torch.tensor(0.0))  # start closed during warmup
+
+        # ---------------- Latent Mixer ----------------
+        if modality_weights == "sum":
+            self.mixer = SumMixer()
+        elif modality_weights == "product":
+            self.mixer = ProductMixer()
+        elif modality_weights == "gating":
+            self.mixer = GatingMixer(self.encoder_latent_dim)
+        elif modality_weights == "cross_attention":
+            self.mixer = CrossAttentionMixer(self.encoder_latent_dim)
+        elif modality_weights == "mlp":
+            self.mixer = MLPMixer(self.encoder_latent_dim)
+        else:
+            self.mixer = None
 
     def set_cross_gate(self, value: float):
         # value in [0,1]; keep as buffer so it's not optimized
@@ -595,7 +671,7 @@ class SPLICEVAE(BaseModuleClass):
 
         # mix representations
         warmup_only_splicing = (
-            self.modality_weights != "concatenate"
+            self.modality_weights not in ("concatenate", *_SAMPLE_BASED_MIXERS)
             and float(self.cross_gate.item()) < 1.0
         )
         if warmup_only_splicing:
@@ -609,7 +685,16 @@ class SPLICEVAE(BaseModuleClass):
             else:
                 qz_m = qzm_expr
                 qz_v = qzv_expr
-            
+
+        elif self.modality_weights in _SAMPLE_BASED_MIXERS:
+            # Mix already-sampled latents directly.
+            # KL is computed from individual posteriors in loss() (kl_mode="individual").
+            # z_spl passed first (AS = Q), z_expr second (GE = K/V) for cross-attention.
+            # TODO: n_samples > 1 not yet supported for sample-based mixers.
+            z_joint = self.mixer(z_spl, z_expr)
+            qz_m = z_joint
+            qz_v = torch.ones_like(z_joint)  # sentinel; not used for KL in this mode
+
         elif self.modality_weights == "concatenate":
             # just glue the two posterior stats end-to-end
             qz_m = torch.cat((qzm_expr, qzm_spl), dim=1)
@@ -643,13 +728,25 @@ class SPLICEVAE(BaseModuleClass):
 
 
         # sample from the mixed representation
-        untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
-        z = self.z_encoder_expression.z_transformation(untran_z)
+        # For sample-based mixers (outside warmup), z_joint is already the latent sample.
+        # For all other modes, sample from the mixed posterior N(qz_m, sqrt(qz_v)).
+        if self.modality_weights in _SAMPLE_BASED_MIXERS and not warmup_only_splicing:
+            z = z_joint  # already sampled; mixer output is the latent
+        else:
+            untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
+            z = self.z_encoder_expression.z_transformation(untran_z)
+
+        kl_mode = (
+            "individual"
+            if self.modality_weights in _SAMPLE_BASED_MIXERS and not warmup_only_splicing
+            else "joint"
+        )
 
         return {
             "z": z,
             "qz_m": qz_m,
             "qz_v": qz_v,
+            "kl_mode": kl_mode,
             "z_expr": z_expr,
             "qzm_expr": qzm_expr,
             "qzv_expr": qzv_expr,
@@ -866,10 +963,19 @@ class SPLICEVAE(BaseModuleClass):
         recon_loss_splicing = rl_splicing
         recon_loss = recon_loss_expression + recon_loss_splicing
 
-        # Compute KL divergence between approximate posterior and prior
-        qz_m = inference_outputs["qz_m"]
-        qz_v = inference_outputs["qz_v"]
-        kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
+        # Compute KL divergence between approximate posterior and prior.
+        # For sample-based mixers (kl_mode="individual"), sum KLs from each encoder's
+        # posterior since z_joint has no closed-form distribution.
+        # For all other modes (kl_mode="joint"), use the mixed posterior directly.
+        if inference_outputs.get("kl_mode", "joint") == "individual":
+            kl_div_z = (
+                kld(Normal(inference_outputs["qzm_expr"], torch.sqrt(inference_outputs["qzv_expr"])), Normal(0, 1)).sum(dim=1)
+                + kld(Normal(inference_outputs["qzm_spl"], torch.sqrt(inference_outputs["qzv_spl"])), Normal(0, 1)).sum(dim=1)
+            )
+        else:
+            qz_m = inference_outputs["qz_m"]
+            qz_v = inference_outputs["qz_v"]
+            kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
 
         # Compute the KL divergence for paired data, passing in the precomputed masks
         kl_div_paired = self._compute_mod_penalty(
