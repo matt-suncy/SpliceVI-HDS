@@ -185,6 +185,148 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
         )
 
 
+def _align_modality_features_or_fail(
+    adata,
+    target_var_names: pd.Index,
+    modality_name: str,
+    split_name: str,
+    train_path: str,
+    source_path: str,
+):
+    """Ensure modality features are compatible with model training features.
+
+    If sets match but order differs, reorder to target_var_names.
+    If sets differ, raise an actionable error for rebuilding test/masked data.
+    """
+    current = pd.Index(adata.var_names.astype(str))
+    target = pd.Index(target_var_names.astype(str))
+
+    if current.equals(target):
+        return adata
+
+    same_set = (
+        len(current) == len(target)
+        and current.is_unique
+        and target.is_unique
+        and current.difference(target).empty
+        and target.difference(current).empty
+    )
+    if same_set:
+        print(
+            f"[DATA/{split_name}] Reordering {modality_name} features to match TRAIN model registry."
+        )
+        return adata[:, target].copy()
+
+    missing = target.difference(current)
+    extra = current.difference(target)
+    missing_preview = missing[:5].tolist()
+    extra_preview = extra[:5].tolist()
+
+    raise ValueError(
+        f"[DATA/{split_name}] Incompatible {modality_name} feature schema for model transfer. "
+        f"TRAIN has {len(target)} features, input has {len(current)} features. "
+        f"Missing-from-input={len(missing)} (example: {missing_preview}); "
+        f"extra-in-input={len(extra)} (example: {extra_preview}). "
+        "This usually means TRAIN and TEST/MASKED files were built with different data-prep logic. "
+        f"TRAIN file: {train_path}; input file: {source_path}. "
+        "Rebuild evaluation inputs from the same TRAIN source, e.g.: "
+        f"python scripts/create_test_split.py --train-path {train_path} "
+        "--output-path data/processed/splicevi_test_compatible.h5mu --test-frac 0.1"
+    )
+
+
+def _ensure_feature_compatibility_or_fail(
+    mdata,
+    target_rna_var_names: pd.Index,
+    target_splicing_var_names: pd.Index,
+    split_name: str,
+    train_path: str,
+    source_path: str,
+):
+    """Align feature order or fail fast when feature sets are incompatible."""
+    aligned_rna = _align_modality_features_or_fail(
+        mdata["rna"],
+        target_rna_var_names,
+        modality_name="RNA",
+        split_name=split_name,
+        train_path=train_path,
+        source_path=source_path,
+    )
+    aligned_splicing = _align_modality_features_or_fail(
+        mdata["splicing"],
+        target_splicing_var_names,
+        modality_name="splicing",
+        split_name=split_name,
+        train_path=train_path,
+        source_path=source_path,
+    )
+
+    if aligned_rna is mdata["rna"] and aligned_splicing is mdata["splicing"]:
+        return mdata
+
+    print(
+        f"[DATA/{split_name}] Rebuilding MuData container after feature alignment."
+    )
+    m_aligned = mu.MuData({"rna": aligned_rna, "splicing": aligned_splicing})
+    m_aligned.obs = mdata.obs.copy()
+    return m_aligned
+
+
+def _ensure_batch_key_available(mdata, batch_key: Optional[str], split_name: str):
+    """Resolve batch_key from any obs scope and propagate it to all expected obs tables."""
+    if batch_key is None:
+        return None
+
+    source_scope = None
+    source_series = None
+
+    if batch_key in mdata.obs.columns:
+        source_scope = "mdata.obs"
+        source_series = mdata.obs[batch_key]
+    elif "rna" in mdata.mod and batch_key in mdata["rna"].obs.columns:
+        source_scope = "rna.obs"
+        source_series = mdata["rna"].obs[batch_key]
+    elif "splicing" in mdata.mod and batch_key in mdata["splicing"].obs.columns:
+        source_scope = "splicing.obs"
+        source_series = mdata["splicing"].obs[batch_key]
+
+    if source_series is None:
+        global_cols = list(mdata.obs.columns)
+        rna_cols = list(mdata["rna"].obs.columns) if "rna" in mdata.mod else []
+        splicing_cols = list(mdata["splicing"].obs.columns) if "splicing" in mdata.mod else []
+        raise ValueError(
+            f"[MODEL/{split_name}] batch_key '{batch_key}' not found in any obs scope. "
+            f"mdata.obs sample={global_cols[:20]}; "
+            f"rna.obs sample={rna_cols[:20]}; "
+            f"splicing.obs sample={splicing_cols[:20]}"
+        )
+
+    print(
+        f"[MODEL/{split_name}] Using batch_key '{batch_key}' from {source_scope}; "
+        "propagating to all obs scopes."
+    )
+
+    def _propagate_one(obs_df, scope_name):
+        aligned = source_series.reindex(obs_df.index)
+        obs_df[batch_key] = aligned.values
+        n_missing = int(aligned.isna().sum())
+        if n_missing > 0:
+            print(
+                f"[MODEL/{split_name}] WARNING: {n_missing} missing values for "
+                f"'{batch_key}' after propagation to {scope_name}."
+            )
+
+    _propagate_one(mdata.obs, "mdata.obs")
+    if "rna" in mdata.mod:
+        _propagate_one(mdata["rna"].obs, "rna.obs")
+    if "splicing" in mdata.mod:
+        _propagate_one(mdata["splicing"].obs, "splicing.obs")
+
+    n_batch_categories = int(mdata.obs[batch_key].astype("string").nunique(dropna=False))
+    print(f"[MODEL/{split_name}] batch_key '{batch_key}' categories: {n_batch_categories}")
+    return n_batch_categories
+
+
 # ---------------------------------------------------------------------
 # Evaluation helper: train/test split metrics
 # ---------------------------------------------------------------------
@@ -1033,6 +1175,9 @@ def main():
     print(f"[DATA] TRAIN MuData loaded with mods: {list(mdata_train.mod.keys())}")
     print(f"[DATA] TRAIN 'rna' n_obs: {mdata_train['rna'].n_obs}, n_vars: {mdata_train['rna'].n_vars}")
 
+    train_rna_var_names = pd.Index(mdata_train["rna"].var_names.astype(str))
+    train_splicing_var_names = pd.Index(mdata_train["splicing"].var_names.astype(str))
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_train, args.mapping_csv)
 
@@ -1049,6 +1194,8 @@ def main():
     if "X_library_size" in mdata_train["rna"].obsm_keys():
         print("[DATA] Copying TRAIN RNA 'X_library_size' from .obsm to .obs...")
         mdata_train["rna"].obs["X_library_size"] = mdata_train["rna"].obsm["X_library_size"]
+
+    _ensure_batch_key_available(mdata_train, batch_key, split_name="TRAIN")
 
     print("[MODEL] Setting up SPLICEVI on TRAIN MuData ...")
     SPLICEVI.setup_mudata(
@@ -1662,12 +1809,23 @@ def main():
     print(f"[DATA] TEST MuData loaded with mods: {list(mdata_test.mod.keys())}")
     print(f"[DATA] TEST 'rna' n_obs: {mdata_test['rna'].n_obs}, n_vars: {mdata_test['rna'].n_vars}")
 
+    mdata_test = _ensure_feature_compatibility_or_fail(
+        mdata_test,
+        train_rna_var_names,
+        train_splicing_var_names,
+        split_name="TEST",
+        train_path=args.train_mdata_path,
+        source_path=args.test_mdata_path,
+    )
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_test, args.mapping_csv)
 
     if "X_library_size" in mdata_test["rna"].obsm_keys():
         print("[DATA] Copying TEST RNA 'X_library_size' from .obsm to .obs...")
         mdata_test["rna"].obs["X_library_size"] = mdata_test["rna"].obsm["X_library_size"]
+
+    _ensure_batch_key_available(mdata_test, batch_key, split_name="TEST")
 
     print("[MODEL] Setting up SPLICEVI on TEST MuData ...")
     SPLICEVI.setup_mudata(
@@ -1848,6 +2006,16 @@ def main():
                 mdata_masked.mod["splicing"].obs.rename(
                 columns={"donor_id": "mouse.id"},
                 inplace=True)
+
+                mdata_masked = _ensure_feature_compatibility_or_fail(
+                    mdata_masked,
+                    train_rna_var_names,
+                    train_splicing_var_names,
+                    split_name=f"IMPUTE/{tag}",
+                    train_path=args.train_mdata_path,
+                    source_path=masked_path,
+                )
+
                 print(
                     f"[EVAL/IMPUTE/{tag}] Masked MuData loaded. 'rna' n_obs: {mdata_masked['rna'].n_obs}"
                 )
@@ -1863,6 +2031,12 @@ def main():
                     mdata_masked["rna"].obs["X_library_size"] = mdata_masked["rna"].obsm[
                         "X_library_size"
                     ]
+
+                _ensure_batch_key_available(
+                    mdata_masked,
+                    batch_key,
+                    split_name=f"IMPUTE/{tag}",
+                )
 
                 print(f"[EVAL/IMPUTE/{tag}] Setting up SPLICEVI on masked MuData...")
                 SPLICEVI.setup_mudata(

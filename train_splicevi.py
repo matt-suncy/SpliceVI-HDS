@@ -50,6 +50,59 @@ def str2bool(v):
     raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
+def ensure_batch_key_available(mdata, batch_key, split_name="TRAIN"):
+    """Resolve batch_key from any obs scope and propagate it to all expected obs tables."""
+    if batch_key is None:
+        return None
+
+    source_scope = None
+    source_series = None
+
+    if batch_key in mdata.obs.columns:
+        source_scope = "mdata.obs"
+        source_series = mdata.obs[batch_key]
+    elif "rna" in mdata.mod and batch_key in mdata["rna"].obs.columns:
+        source_scope = "rna.obs"
+        source_series = mdata["rna"].obs[batch_key]
+    elif "splicing" in mdata.mod and batch_key in mdata["splicing"].obs.columns:
+        source_scope = "splicing.obs"
+        source_series = mdata["splicing"].obs[batch_key]
+
+    if source_series is None:
+        global_cols = list(mdata.obs.columns)
+        rna_cols = list(mdata["rna"].obs.columns) if "rna" in mdata.mod else []
+        splicing_cols = list(mdata["splicing"].obs.columns) if "splicing" in mdata.mod else []
+        raise ValueError(
+            f"[MODEL/{split_name}] batch_key '{batch_key}' not found in any obs scope. "
+            f"mdata.obs sample={global_cols[:20]}; "
+            f"rna.obs sample={rna_cols[:20]}; "
+            f"splicing.obs sample={splicing_cols[:20]}"
+        )
+
+    print(
+        f"[MODEL/{split_name}] Using batch_key '{batch_key}' from {source_scope}; "
+        "propagating to all obs scopes."
+    )
+
+    def _propagate_one(obs_df, scope_name):
+        aligned = source_series.reindex(obs_df.index)
+        obs_df[batch_key] = aligned.values
+        n_missing = int(aligned.isna().sum())
+        if n_missing > 0:
+            print(
+                f"[MODEL/{split_name}] WARNING: {n_missing} missing values for "
+                f"'{batch_key}' after propagation to {scope_name}."
+            )
+
+    _propagate_one(mdata.obs, "mdata.obs")
+    if "rna" in mdata.mod:
+        _propagate_one(mdata["rna"].obs, "rna.obs")
+    if "splicing" in mdata.mod:
+        _propagate_one(mdata["splicing"].obs, "splicing.obs")
+
+    return int(mdata.obs[batch_key].astype("string").nunique(dropna=False))
+
+
 def build_argparser(init_defaults, train_defaults):
     parser = argparse.ArgumentParser(
         "train_multivisplice_basic",
@@ -75,8 +128,11 @@ def build_argparser(init_defaults, train_defaults):
     parser.add_argument(
         "--batch_key",
         type=str,
-        default="None",
-        help="Optional obs column used as batch_key in setup_mudata. Use 'None' to disable.",
+        default="seq_batch",
+        help=(
+            "obs column used as batch_key in setup_mudata. "
+            "Default: 'seq_batch'. Use 'None' to disable."
+        ),
     )
 
     # Optional: W&B integration
@@ -221,6 +277,17 @@ def main():
     # 4. Setup SPLICEVI
     # ------------------------------
     batch_key = None if (args.batch_key is None or str(args.batch_key).lower() == "none") else args.batch_key
+    if batch_key is not None:
+        n_batch_categories = ensure_batch_key_available(mdata, batch_key, split_name="TRAIN")
+        if n_batch_categories <= 1:
+            print(
+                f"[MODEL] WARNING: batch_key '{batch_key}' has {n_batch_categories} category. "
+                "Batch correction may be ineffective."
+            )
+        else:
+            print(
+                f"[MODEL] batch_key '{batch_key}' categories: {n_batch_categories}"
+            )
     print(f"[MODEL] Using batch_key      : {batch_key}")
     print("[MODEL] Setting up SPLICEVI with standard MuData configuration...")
     SPLICEVI.setup_mudata(
