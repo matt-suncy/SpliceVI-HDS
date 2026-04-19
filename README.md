@@ -98,13 +98,26 @@ python scripts/validate_splicevi_mudata.py \
   --mask-atse-threshold 0
 ```
 
-3. Train using the generated file:
+3. Create paper-aligned external split artifacts (70/30 stratified on `age_numeric` + `class`):
+
+```bash
+python scripts/create_test_split.py \
+  --train-path data/processed/splicevi_custom_input.h5mu \
+  --output-train-path data/processed/splicevi_custom_input_train70.h5mu \
+  --output-test-path data/processed/splicevi_custom_input_test30.h5mu \
+  --test-frac 0.3 \
+  --seed 42 \
+  --stratify-age-col age_numeric \
+  --stratify-celltype-col class
+```
+
+4. Train using the external-train split file:
 
 ```bash
 python train_splicevi.py \
-  --train_mdata_path data/processed/splicevi_custom_input.h5mu \
+  --train_mdata_path data/processed/splicevi_custom_input_train70.h5mu \
   --model_dir models/custom_baseline_run \
-  --batch_key None
+  --batch_key seq_batch
 ```
 
 One-command helper:
@@ -112,6 +125,10 @@ One-command helper:
 ```bash
 bash scripts/run_custom_pipeline.sh
 ```
+
+Detailed split behavior and reproducibility checklist:
+
+- See [docs/DATA_SPLITTING.md](docs/DATA_SPLITTING.md)
 
 ## Retrained Model Evaluation (Smoke -> Full)
 

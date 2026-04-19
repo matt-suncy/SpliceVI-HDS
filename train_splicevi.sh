@@ -46,7 +46,7 @@ MODEL_DIR_BASE="models"
 SCRIPT_PATH="train_splicevi.py"
 
 # Batch column in obs; set to "None" to disable batch correction
-BATCH_KEY="None"
+BATCH_KEY="seq_batch"
 
 # 2) Conda / environment
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
