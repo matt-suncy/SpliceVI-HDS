@@ -3,7 +3,7 @@
 
 Default behavior matches the paper split policy:
 - 70/30 external train/test split (``--test-frac 0.3``)
-- Stratified by ``age_numeric`` and ``class``
+- Stratified by ``age_days`` and ``class``
 - Deterministic with a fixed seed
 """
 
@@ -86,7 +86,7 @@ def create_train_test_split(
     output_test_path: str,
     test_frac: float = 0.3,
     seed: int = 42,
-    stratify_age_col: str = "age_numeric",
+    stratify_age_col: str = "age_days",
     stratify_celltype_col: str = "class",
     min_stratum_size: int = 5,
     missing_label: str = "unknown",
@@ -246,8 +246,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stratify-age-col",
         type=str,
-        default="age_numeric",
-        help="obs column used for age stratification (default: age_numeric).",
+        default="age_days",
+        help="obs column used for age stratification (default: age_days).",
     )
     parser.add_argument(
         "--stratify-celltype-col",

@@ -36,7 +36,7 @@ import seaborn as sns
 
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.linear_model import LogisticRegression, RidgeCV
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import (
@@ -44,6 +44,8 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     f1_score,
+    mean_absolute_error,
+    mean_squared_error,
     silhouette_score,
     adjusted_mutual_info_score,
 )
@@ -371,6 +373,7 @@ def evaluate_split(
     model,
     umap_color_key: str,
     cell_type_classification_key: str,
+    age_target_col: str,
     Z_type: str = "joint",
     wandb=None,
     precomputed_Z: Optional[np.ndarray] = None,
@@ -481,21 +484,26 @@ def evaluate_split(
         )
 
     # Age regression tasks
-    if "age_numeric" in mdata.obs:
-        print(f"[EVAL/{name}-{Z_type}] Running age R² regression tasks...")
-        ages_full = mdata.obs["age_numeric"].astype(float).values
-        target_ages = np.array([3.0, 18.0, 24.0], dtype=float)
-        mask_age = np.isin(ages_full, target_ages)
+    age_candidates = []
+    for candidate in [age_target_col, "age_days", "age_numeric"]:
+        if candidate and candidate not in age_candidates:
+            age_candidates.append(candidate)
+    age_col = next((c for c in age_candidates if c in mdata.obs.columns), None)
+
+    if age_col is not None:
+        print(f"[EVAL/{name}-{Z_type}] Running linear regression for '{age_col}'...")
+        age_series = pd.to_numeric(mdata.obs[age_col], errors="coerce")
+        mask_age = age_series.notna().to_numpy()
         n_kept = int(mask_age.sum())
-        print(f"[EVAL/{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells at ages {target_ages.tolist()}")
+        print(f"[EVAL/{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells with valid '{age_col}'.")
 
         if n_kept < MIN_GROUP_N:
             print(
-                f"[EVAL/{name}-{Z_type}] Only {n_kept} cells with target ages; skipping age R² tasks."
+                f"[EVAL/{name}-{Z_type}] Only {n_kept} cells have valid '{age_col}'; skipping age regression."
             )
             return
 
-        ages = ages_full[mask_age]
+        ages = age_series.to_numpy(dtype=float)[mask_age]
         Z_use = Z[mask_age, :]
         obs_local = mdata.obs.iloc[np.where(mask_age)[0]].copy()
 
@@ -504,33 +512,42 @@ def evaluate_split(
             X_latent, ages, test_size=0.2, random_state=0
         )
 
-        # Global R²
+        # Global linear regression metrics
         if np.std(y_tr) == 0.0 or np.std(y_ev) == 0.0:
             print(
-                f"[EVAL/{name}-{Z_type}] Degenerate age variance after filtering; skipping global age R²."
+                f"[EVAL/{name}-{Z_type}] Degenerate '{age_col}' variance; skipping global regression metrics."
             )
         else:
-            ridge = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(X_tr, y_tr)
-            r2_age = ridge.score(X_ev, y_ev)
-            print(f"[EVAL/{name}-{Z_type}] Global age R²: {r2_age:.4f}")
+            linreg = LinearRegression().fit(X_tr, y_tr)
+            y_pred = linreg.predict(X_ev)
+            r2_age = float(linreg.score(X_ev, y_ev))
+            mae_age = float(mean_absolute_error(y_ev, y_pred))
+            rmse_age = float(np.sqrt(mean_squared_error(y_ev, y_pred)))
+
+            print(
+                f"[EVAL/{name}-{Z_type}] Global {age_col} metrics: "
+                f"R²={r2_age:.4f}, MAE={mae_age:.4f}, RMSE={rmse_age:.4f}"
+            )
             if wandb is not None:
                 wandb.log(
                     {
-                        f"real-{name}-{Z_type}/age_r2": r2_age,
-                        f"real-{name}-{Z_type}/age_n_cells": n_kept,
+                        f"real-{name}-{Z_type}/{age_col}_r2": r2_age,
+                        f"real-{name}-{Z_type}/{age_col}_mae": mae_age,
+                        f"real-{name}-{Z_type}/{age_col}_rmse": rmse_age,
+                        f"real-{name}-{Z_type}/{age_col}_n_cells": n_kept,
                     }
                 )
 
-        # Per (tissue | cell_type) R²
-        if "tissue" in obs_local:
-            ct_key = cell_type_classification_key
+        # Per (tissue | cell_type) regression metrics
+        if "tissue" in obs_local and cell_type_classification_key in obs_local:
             tissue_series = obs_local["tissue"].astype(str)
-            ct_series = obs_local[ct_key].astype(str)
+            ct_series = obs_local[cell_type_classification_key].astype(str)
             pair = tissue_series + " | " + ct_series
             pair_unique = pair.unique()
 
             print(
-                f"[EVAL/{name}-{Z_type}] Computing per-group age R² for {len(pair_unique)} tissue|cell_type pairs..."
+                f"[EVAL/{name}-{Z_type}] Computing per-group {age_col} regression for "
+                f"{len(pair_unique)} tissue|cell_type pairs..."
             )
 
             for p in pair_unique:
@@ -540,7 +557,6 @@ def evaluate_split(
 
                 Zg = X_latent[idx]
                 yg = ages[idx]
-
                 if np.std(yg) == 0.0:
                     continue
 
@@ -555,25 +571,31 @@ def evaluate_split(
                 ):
                     continue
 
-                try:
-                    rg = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(Ztr, ytr)
-                    r2g = rg.score(Zev, yev)
-                except Exception:
-                    continue
+                rg = LinearRegression().fit(Ztr, ytr)
+                yg_pred = rg.predict(Zev)
+                r2g = float(rg.score(Zev, yev))
+                maeg = float(mean_absolute_error(yev, yg_pred))
+                rmseg = float(np.sqrt(mean_squared_error(yev, yg_pred)))
 
                 AGE_R2_RECORDS.append(
                     {
                         "dataset": name,
                         "space": Z_type,
+                        "age_target_col": age_col,
                         "pair": p,
                         "tissue": p.split(" | ", 1)[0],
                         "cell_type": p.split(" | ", 1)[1],
-                        "r2": float(r2g),
+                        "r2": r2g,
+                        "mae": maeg,
+                        "rmse": rmseg,
                         "n": int(idx.size),
                     }
                 )
     else:
-        print(f"[EVAL/{name}-{Z_type}] No 'age_numeric' column found; skipping age R².")
+        print(
+            f"[EVAL/{name}-{Z_type}] No age target column found in obs "
+            f"(candidates={age_candidates}); skipping age regression."
+        )
 
 
 def run_cross_fold_classification(
@@ -982,7 +1004,16 @@ def build_argparser():
         default=None,
         help=(
             "List of .obs keys to color TRAIN UMAPs by. "
-            "If not provided, defaults to ['broad_cell_type', 'medium_cell_type' (if present)]."
+            "If not provided, defaults include cell-type keys and age_days (if present)."
+        ),
+    )
+    parser.add_argument(
+        "--age_target_col",
+        type=str,
+        default="age_days",
+        help=(
+            "obs column to use for age regression (default: age_days). "
+            "If missing, falls back to age_days/age_numeric when available."
         ),
     )
 
@@ -1118,6 +1149,7 @@ def main():
         "evals": list(EVALS),
         "umap_top_n_celltypes": args.umap_top_n_celltypes,
         "umap_obs_keys": args.umap_obs_keys,
+        "age_target_col": args.age_target_col,
         "cross_fold_targets": cross_fold_targets,
         "cross_fold_splits": cross_fold_splits,
         "cross_fold_k": args.cross_fold_k,
@@ -1275,6 +1307,8 @@ def main():
         umap_obs_keys = list(dict.fromkeys(args.umap_obs_keys))
         if "group_highlighted" not in umap_obs_keys:
             umap_obs_keys.insert(0, "group_highlighted")
+        if "age_days" in mdata_train.obs.columns and "age_days" not in umap_obs_keys:
+            umap_obs_keys.append("age_days")
         print(f"[UMAP] Using user-provided UMAP obs keys: {umap_obs_keys}")
     else:
         umap_obs_keys = ["group_highlighted"]
@@ -1282,6 +1316,8 @@ def main():
             umap_obs_keys.extend([umap_color_key, cell_type_classification_key])
         else:
             umap_obs_keys.append(umap_color_key)
+        if "age_days" in mdata_train.obs.columns and "age_days" not in umap_obs_keys:
+            umap_obs_keys.append("age_days")
         print(f"[UMAP] UMAP obs keys not provided; using defaults: {umap_obs_keys}")
 
     # Latent spaces
@@ -1746,6 +1782,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="joint",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("joint"),
@@ -1756,6 +1793,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="expression",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("expression"),
@@ -1766,6 +1804,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("splicing"),
@@ -1867,6 +1906,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="joint",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("joint"),
@@ -1877,6 +1917,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="expression",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("expression"),
@@ -1887,6 +1928,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("splicing"),

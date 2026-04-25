@@ -223,6 +223,7 @@ m = mu.read_h5mu(path, backed="r")
 cols = list(m["rna"].obs.columns)
 
 preferred_umap = [
+    "age_days",
     "broad_cell_type",
     "medium_cell_type",
     "class",

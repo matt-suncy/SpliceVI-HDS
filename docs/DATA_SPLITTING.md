@@ -12,7 +12,7 @@ The split policy is designed to match the paper's two-level split behavior:
 
 In this repository, external stratification uses:
 
-1. Age column: `age_numeric`.
+1. Age column: `age_days`.
 2. Cell-type column: `class`.
 
 ## Where Splitting Happens
@@ -56,14 +56,14 @@ Implemented in `scripts/create_test_split.py`.
 3. Split parameters:
    - `--test-frac` (default `0.3`)
    - `--seed` (default `42`)
-   - `--stratify-age-col` (default `age_numeric`)
+   - `--stratify-age-col` (default `age_days`)
    - `--stratify-celltype-col` (default `class`)
    - `--min-stratum-size` (default `5`)
 
 ### Steps
 
 1. Read full MuData.
-2. Build stratum key per cell: `age_numeric || class`.
+2. Build stratum key per cell: `age_days || class`.
 3. Fill missing stratification values with `unknown`.
 4. Collapse rare strata (count < `min_stratum_size`) to `other`.
 5. Perform deterministic split with `train_test_split(..., stratify=strata, random_state=seed)`.
@@ -127,6 +127,16 @@ Before training/evaluation:
 5. Split ratio is close to 70/30 (integer rounding expected).
 6. Age and class distributions are reasonably preserved between full/train/test.
 
+### Splicing feature identity assumption
+
+The split script preserves feature axes from the full MuData file. In the
+current builder, splicing features are deduplicated unique junctions keyed by:
+
+`(event_type, gene_id, junction_side, junction_start, junction_end)`.
+
+As a result, train/test compatibility checks should compare these deduplicated
+junction feature names (not the old "2 rows per event" expanded rows).
+
 ## Commands
 
 ### Create split artifacts
@@ -138,7 +148,7 @@ python scripts/create_test_split.py \
   --output-test-path data/processed/splicevi_custom_input_test30.h5mu \
   --test-frac 0.3 \
   --seed 42 \
-  --stratify-age-col age_numeric \
+  --stratify-age-col age_days \
   --stratify-celltype-col class \
   --min-stratum-size 5
 ```
@@ -154,7 +164,7 @@ Environment overrides for split behavior:
 ```bash
 SPLIT_SEED=42 \
 SPLIT_TEST_FRAC=0.3 \
-SPLIT_AGE_COL=age_numeric \
+SPLIT_AGE_COL=age_days \
 SPLIT_CELLTYPE_COL=class \
 SPLIT_MIN_STRATUM_SIZE=5 \
 bash scripts/run_custom_pipeline.sh
@@ -162,7 +172,7 @@ bash scripts/run_custom_pipeline.sh
 
 ## Failure Modes
 
-1. Missing `age_numeric` or `class` columns:
+1. Missing `age_days` or `class` columns:
    - Split fails with explicit column error.
 2. Too many rare strata:
    - Rare strata collapse to `other` before splitting.

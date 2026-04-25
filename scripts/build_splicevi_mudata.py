@@ -160,8 +160,11 @@ def _make_obs(
     if not metadata_paths:
         raise ValueError("At least one metadata CSV path must be provided.")
 
-    frames = [_read_metadata_csv(p) for p in metadata_paths]
+    frames = [_read_metadata_csv(p).rename(columns=lambda c: str(c).strip()) for p in metadata_paths]
     obs = pd.concat(frames, axis=0, ignore_index=True)
+    duplicated_cols = pd.Index(obs.columns)[pd.Index(obs.columns).duplicated()].tolist()
+    if duplicated_cols:
+        raise ValueError(f"metadata has duplicate columns after normalization: {duplicated_cols}")
     if "seq_name" not in obs.columns:
         raise ValueError("metadata file must contain a 'seq_name' column.")
 
@@ -181,6 +184,29 @@ def _make_obs(
             obs["donor_id"] = obs["donor"]
         else:
             obs["donor_id"] = obs.index
+
+    age_col = "age_days" if "age_days" in obs.columns else None
+    if age_col is None:
+        for c in ("age_numeric", "age_day", "age", "age_in_days"):
+            if c in obs.columns:
+                obs["age_days"] = obs[c]
+                age_col = c
+                break
+    if age_col is None:
+        raise ValueError(
+            "metadata must contain 'age_days' (or one of: age_numeric, age_day, age, age_in_days)."
+        )
+
+    age_days = pd.to_numeric(obs["age_days"], errors="coerce")
+    if age_days.isna().all():
+        raise ValueError(
+            f"metadata age column '{age_col}' could not be parsed into numeric age values."
+        )
+    obs["age_days"] = age_days.astype(np.float32)
+
+    # Keep backward compatibility for existing split/eval scripts that may still expect age_numeric.
+    if "age_numeric" not in obs.columns:
+        obs["age_numeric"] = obs["age_days"]
 
     if expr_group_map is not None:
         obs["expr_group"] = obs.index.to_series().map(expr_group_map).fillna("unknown")
@@ -203,6 +229,13 @@ def _unique_feature_index(primary: pd.Series, secondary: pd.Series, prefix: str)
         seen[base] = n + 1
         out.append(base if n == 0 else f"{base}__dup{n}")
     return pd.Index(out)
+
+
+def _compact_unique_join(values: pd.Series, max_items: int = 5) -> str:
+    uniq = pd.Index(values.astype(str)).drop_duplicates().tolist()
+    if len(uniq) <= max_items:
+        return ";;".join(uniq)
+    return ";;".join(uniq[:max_items]) + f";;...(+{len(uniq) - max_items})"
 
 
 def build(args: argparse.Namespace) -> None:
@@ -283,7 +316,12 @@ def build(args: argparse.Namespace) -> None:
     rna.obs["X_library_size"] = libsize
     rna.obsm["X_library_size"] = libsize.reshape(-1, 1)
 
+    if args.junction_dedup_mode != "enabled":
+        raise ValueError("Only junction dedup mode 'enabled' is supported.")
+
     # Build splicing modality from event-level PSI and event_id-derived metadata.
+    # We keep two-junction expansion as intermediate representation and then collapse
+    # duplicate genomic junctions.
     raw_event_ids = sp_df["#event_id"].astype(str).to_numpy()
     gene_names = sp_df["NAME"].astype(str).to_numpy()
     parsed_events = [_parse_event_id(eid) for eid in raw_event_ids]
@@ -292,11 +330,12 @@ def build(args: argparse.Namespace) -> None:
     if n_events == 0:
         raise ValueError("No splicing rows available after filtering.")
 
-    n_junctions = n_events * 2
+    n_junctions_expanded = n_events * 2
     expanded_vals = np.repeat(sp_vals, 2, axis=0)
-    junction_support = np.zeros(n_junctions, dtype=np.float32)
+    junction_support = np.zeros(n_junctions_expanded, dtype=np.float32)
 
     junc_ids: list[str] = []
+    gene_id_list: list[str] = []
     event_groups_list: list[str] = []
     gene_name_list: list[str] = []
     event_type_list: list[str] = []
@@ -315,6 +354,7 @@ def build(args: argparse.Namespace) -> None:
         event_group = _derive_event_group(parsed, args.atse_grouping_mode)
         raw_event = str(parsed["raw_event_id"])
         event_type = str(parsed["event_type"])
+        gene_id = str(parsed["gene_id"])
         upstream_end = int(parsed["upstream_end"])
         cassette_start = int(parsed["cassette_start"])
         cassette_end = int(parsed["cassette_end"])
@@ -324,6 +364,7 @@ def build(args: argparse.Namespace) -> None:
 
         # Upstream inclusion junction: (upstream_end, cassette_start)
         junc_ids.append(f"{raw_event}|JUP:{upstream_end}-{cassette_start}")
+        gene_id_list.append(gene_id)
         event_groups_list.append(event_group)
         gene_name_list.append(str(gene_name))
         event_type_list.append(event_type)
@@ -341,6 +382,7 @@ def build(args: argparse.Namespace) -> None:
 
         # Downstream inclusion junction: (cassette_end, downstream_start)
         junc_ids.append(f"{raw_event}|JDN:{cassette_end}-{downstream_start}")
+        gene_id_list.append(gene_id)
         event_groups_list.append(event_group)
         gene_name_list.append(str(gene_name))
         event_type_list.append(event_type)
@@ -356,45 +398,83 @@ def build(args: argparse.Namespace) -> None:
         exc_support_list.append(exc_support)
         junction_support[2 * i + 1] = float(exc_support)
 
-    event_groups = pd.Series(event_groups_list, dtype=str)
-    junc_id_series = pd.Series(junc_ids, dtype=str)
-    gene_name_series = pd.Series(gene_name_list, dtype=str)
-
-    sp_var = pd.DataFrame(
+    expanded_df = pd.DataFrame(
         {
-            "junction_id": junc_id_series.to_numpy(),
             "source_event_id": np.asarray(source_event_id_list, dtype=object),
+            "event_id": np.asarray(event_groups_list, dtype=object),
             "event_type": np.asarray(event_type_list, dtype=object),
-            "gene_name": gene_name_series.to_numpy(),
-            "event_id": event_groups.to_numpy(),
+            "gene_id": np.asarray(gene_id_list, dtype=object),
+            "gene_name": np.asarray(gene_name_list, dtype=object),
             "junction_side": np.asarray(junction_side_list, dtype=object),
             "junction_start": np.asarray(junction_start_list, dtype=np.int32),
             "junction_end": np.asarray(junction_end_list, dtype=np.int32),
+            "support": junction_support.astype(np.float32),
+            "expanded_junction_id": np.asarray(junc_ids, dtype=object),
             "upstream_end": np.asarray(upstream_end_list, dtype=np.int32),
             "cassette_start": np.asarray(cassette_start_list, dtype=np.int32),
             "cassette_end": np.asarray(cassette_end_list, dtype=np.int32),
             "downstream_start": np.asarray(downstream_start_list, dtype=np.int32),
             "inc_support": np.asarray(inc_support_list, dtype=np.int32),
             "exc_support": np.asarray(exc_support_list, dtype=np.int32),
-            "modality": "Splicing",
-        },
-        index=_unique_feature_index(junc_id_series, gene_name_series, "junction"),
+            "expanded_row_index": np.arange(n_junctions_expanded, dtype=np.int32),
+        }
     )
 
-    ratio_csr = sparse.csr_matrix(expanded_vals.T)
+    dedup_key_cols = [
+        "event_type",
+        "gene_id",
+        "junction_side",
+        "junction_start",
+        "junction_end",
+    ]
+    dedup_keys = pd.MultiIndex.from_frame(expanded_df[dedup_key_cols])
+    expanded_to_unique_codes, unique_dedup_keys = pd.factorize(dedup_keys, sort=False)
+    n_junctions_unique = int(len(unique_dedup_keys))
+    expanded_df["unique_junction_index"] = expanded_to_unique_codes.astype(np.int32)
 
-    junc_counts_dense = np.rint(expanded_vals * junction_support[:, None]).astype(np.int32)
-    junc_counts_dense = np.clip(junc_counts_dense, 0, None)
-    junc_counts_csr = sparse.csr_matrix(junc_counts_dense.T)
+    expanded_to_unique = sparse.coo_matrix(
+        (
+            np.ones(n_junctions_expanded, dtype=np.int8),
+            (
+                np.arange(n_junctions_expanded, dtype=np.int32),
+                expanded_to_unique_codes.astype(np.int32),
+            ),
+        ),
+        shape=(n_junctions_expanded, n_junctions_unique),
+    ).tocsr()
 
-    event_codes, event_uniques = pd.factorize(event_groups, sort=True)
+    junc_counts_expanded_dense = np.rint(expanded_vals * junction_support[:, None]).astype(np.int32)
+    junc_counts_expanded_dense = np.clip(junc_counts_expanded_dense, 0, None)
+    junc_counts_expanded_csr = sparse.csr_matrix(junc_counts_expanded_dense.T)
+    junc_counts_csr = (junc_counts_expanded_csr @ expanded_to_unique).astype(np.int32)
+
+    support_sum = np.bincount(
+        expanded_to_unique_codes,
+        weights=junction_support.astype(np.float64),
+        minlength=n_junctions_unique,
+    ).astype(np.float32)
+
+    ratio_csr = junc_counts_csr.astype(np.float32).tocsr()
+    inv_support = np.zeros_like(support_sum, dtype=np.float32)
+    valid_support = support_sum > 0
+    inv_support[valid_support] = 1.0 / support_sum[valid_support]
+    ratio_csr = (ratio_csr @ sparse.diags(inv_support, offsets=0, format="csr")).tocsr()
+    if ratio_csr.nnz:
+        ratio_csr.data = np.clip(ratio_csr.data, 0.0, 1.0)
+
+    event_codes, event_uniques = pd.factorize(expanded_df["event_id"].astype(str), sort=True)
     j2e = sparse.coo_matrix(
         (
-            np.ones_like(event_codes, dtype=np.int8),
-            (np.arange(len(event_codes), dtype=np.int32), event_codes.astype(np.int32)),
+            np.ones(n_junctions_expanded, dtype=np.int8),
+            (
+                expanded_to_unique_codes.astype(np.int32),
+                event_codes.astype(np.int32),
+            ),
         ),
-        shape=(len(event_codes), len(event_uniques)),
+        shape=(n_junctions_unique, len(event_uniques)),
     ).tocsr()
+    if j2e.nnz:
+        j2e.data = np.ones_like(j2e.data, dtype=np.int8)
     event_cluster_counts = (junc_counts_csr @ j2e).astype(np.int32)
     cluster_counts = (event_cluster_counts @ j2e.T).astype(np.int32)
 
@@ -402,6 +482,71 @@ def build(args: argparse.Namespace) -> None:
     mask_csr = (event_observed @ j2e.T).astype(np.int8).tocsr()
     if mask_csr.nnz > 0:
         mask_csr.data = np.ones_like(mask_csr.data, dtype=np.int8)
+
+    unique_meta = (
+        expanded_df.groupby("unique_junction_index", sort=False)
+        .agg(
+            event_type=("event_type", "first"),
+            gene_id=("gene_id", "first"),
+            gene_name=("gene_name", "first"),
+            junction_side=("junction_side", "first"),
+            junction_start=("junction_start", "first"),
+            junction_end=("junction_end", "first"),
+            support_sum=("support", "sum"),
+            source_event_count=("source_event_id", "nunique"),
+            source_event_examples=("source_event_id", _compact_unique_join),
+            event_id_primary=("event_id", "first"),
+            event_id_memberships=(
+                "event_id",
+                lambda s: ";;".join(pd.Index(s.astype(str)).drop_duplicates().tolist()),
+            ),
+            event_id_membership_count=("event_id", "nunique"),
+            upstream_end=("upstream_end", "first"),
+            cassette_start=("cassette_start", "first"),
+            cassette_end=("cassette_end", "first"),
+            downstream_start=("downstream_start", "first"),
+        )
+        .reset_index(drop=True)
+    )
+
+    junction_id_series = (
+        unique_meta["event_type"].astype(str)
+        + "|"
+        + unique_meta["gene_id"].astype(str)
+        + "|"
+        + unique_meta["junction_side"].astype(str)
+        + "|"
+        + unique_meta["junction_start"].astype(str)
+        + "-"
+        + unique_meta["junction_end"].astype(str)
+    )
+    if junction_id_series.duplicated().any():
+        dup_examples = junction_id_series[junction_id_series.duplicated()].head(5).tolist()
+        raise ValueError(f"Duplicate junction_id values after deduplication: {dup_examples}")
+
+    sp_var = pd.DataFrame(
+        {
+            "junction_id": junction_id_series.to_numpy(),
+            "event_type": unique_meta["event_type"].astype(str).to_numpy(),
+            "gene_id": unique_meta["gene_id"].astype(str).to_numpy(),
+            "gene_name": unique_meta["gene_name"].astype(str).to_numpy(),
+            "event_id": unique_meta["event_id_primary"].astype(str).to_numpy(),
+            "event_id_memberships": unique_meta["event_id_memberships"].astype(str).to_numpy(),
+            "event_id_membership_count": unique_meta["event_id_membership_count"].astype(np.int32).to_numpy(),
+            "source_event_count": unique_meta["source_event_count"].astype(np.int32).to_numpy(),
+            "source_event_examples": unique_meta["source_event_examples"].astype(str).to_numpy(),
+            "junction_side": unique_meta["junction_side"].astype(str).to_numpy(),
+            "junction_start": unique_meta["junction_start"].astype(np.int32).to_numpy(),
+            "junction_end": unique_meta["junction_end"].astype(np.int32).to_numpy(),
+            "junction_support_sum": unique_meta["support_sum"].astype(np.float32).to_numpy(),
+            "upstream_end": unique_meta["upstream_end"].astype(np.int32).to_numpy(),
+            "cassette_start": unique_meta["cassette_start"].astype(np.int32).to_numpy(),
+            "cassette_end": unique_meta["cassette_end"].astype(np.int32).to_numpy(),
+            "downstream_start": unique_meta["downstream_start"].astype(np.int32).to_numpy(),
+            "modality": "Splicing",
+        },
+        index=pd.Index(junction_id_series.to_numpy(), dtype=str),
+    )
 
     sp_obs = obs.copy()
     sp_obs.index = shared_samples
@@ -423,6 +568,15 @@ def build(args: argparse.Namespace) -> None:
     print(f"Cells: {mdata.n_obs}")
     print(f"Genes: {mdata['rna'].n_vars}")
     print(f"Junctions: {mdata['splicing'].n_vars}")
+    print(f"Event rows: {n_events}")
+    print(f"Expanded junction rows (pre-dedup): {n_junctions_expanded}")
+    print(f"Unique junction rows (post-dedup): {n_junctions_unique}")
+    reduction_pct = (
+        (1.0 - (float(n_junctions_unique) / float(n_junctions_expanded))) * 100.0
+        if n_junctions_expanded > 0
+        else 0.0
+    )
+    print(f"Junction dedup reduction: {reduction_pct:.2f}%")
     print(f"ATSE groups: {len(event_uniques)}")
     print(f"ATSE grouping mode: {args.atse_grouping_mode}")
     print(f"Mask threshold (ATSE > threshold): {args.mask_atse_threshold}")
@@ -481,6 +635,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Binary mask rule: mask=1 when ATSE count > threshold.",
+    )
+    parser.add_argument(
+        "--junction-dedup-mode",
+        type=str,
+        default="enabled",
+        choices=["enabled"],
+        help=(
+            "Junction feature construction mode. "
+            "Only 'enabled' is supported; expanded rows are deduplicated to unique junctions."
+        ),
     )
     parser.add_argument(
         "--min-cells-per-feature",
