@@ -63,9 +63,9 @@ class CrossAttentionMixer(nn.Module):
 
 class MLPMixer(nn.Module):
     """Concatenate both latents, pass through a two-layer MLP, project back to n_latent."""
-    def __init__(self, n_latent, n_hidden=None):
+    def __init__(self, n_latent, n_hidden=128):
         super().__init__()
-        n_hidden = n_hidden or n_latent * 2
+        # n_hidden = n_hidden or n_latent * 2
         self.net = nn.Sequential(
             nn.Linear(2 * n_latent, n_hidden),
             nn.ReLU(),
