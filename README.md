@@ -98,13 +98,26 @@ python scripts/validate_splicevi_mudata.py \
   --mask-atse-threshold 0
 ```
 
-3. Train using the generated file:
+3. Create paper-aligned external split artifacts (70/30 stratified on `age_days` + `class`):
+
+```bash
+python scripts/create_test_split.py \
+  --train-path data/processed/splicevi_custom_input.h5mu \
+  --output-train-path data/processed/splicevi_custom_input_train70.h5mu \
+  --output-test-path data/processed/splicevi_custom_input_test30.h5mu \
+  --test-frac 0.3 \
+  --seed 42 \
+  --stratify-age-col age_days \
+  --stratify-celltype-col class
+```
+
+4. Train using the external-train split file:
 
 ```bash
 python train_splicevi.py \
-  --train_mdata_path data/processed/splicevi_custom_input.h5mu \
+  --train_mdata_path data/processed/splicevi_custom_input_train70.h5mu \
   --model_dir models/custom_baseline_run \
-  --batch_key None
+  --batch_key seq_batch
 ```
 
 One-command helper:
@@ -112,6 +125,10 @@ One-command helper:
 ```bash
 bash scripts/run_custom_pipeline.sh
 ```
+
+Detailed split behavior and reproducibility checklist:
+
+- See [docs/DATA_SPLITTING.md](docs/DATA_SPLITTING.md)
 
 ## Retrained Model Evaluation (Smoke -> Full)
 
@@ -164,18 +181,26 @@ The builder writes a `.h5mu` with:
 - `splicing.var['modality'] == 'Splicing'`
 - `splicing.var['event_id']` (ATSE grouping)
 - `obs['donor_id']`
+- `obs['age_days']` (numeric; mirrored to `age_numeric` for compatibility)
 
 ### Notes on Splicing Layer Construction
 
 The builder derives required splicing layers directly from the event IDs in
 `MO_VIS_core.individual.cass.mat.txt`:
 
-- Each event row is expanded into two junction features:
+- Each event row is first expanded into two intermediate junction rows:
   - upstream junction `(upstream_end, cassette_start)`
   - downstream junction `(cassette_end, downstream_start)`
+- Intermediate rows are then collapsed to unique genomic junction features using
+  key `(event_type, gene_id, junction_side, junction_start, junction_end)`.
+  This removes duplicate per-row junction artifacts while preserving gene-aware
+  coordinates and junction-side identity.
 - Junction counts are inferred from event support fields in `[inc/exc]` and PSI:
   - upstream count per cell: `round(PSI * inc_support)`
   - downstream count per cell: `round(PSI * exc_support)`
+- For collapsed junctions, counts and support are aggregated across contributing
+  intermediate rows; `junc_ratio` is recomputed as
+  `aggregated_counts / aggregated_support` and clipped to `[0, 1]`.
 - ATSE counts are computed by summing junction counts within grouping key
   `splicing.var['event_id']`, controlled by `--atse-grouping-mode`:
   - `both_anchors` (default)

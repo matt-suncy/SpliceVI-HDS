@@ -36,7 +36,7 @@ import seaborn as sns
 
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.linear_model import LogisticRegression, RidgeCV
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import (
@@ -44,6 +44,8 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     f1_score,
+    mean_absolute_error,
+    mean_squared_error,
     silhouette_score,
     adjusted_mutual_info_score,
 )
@@ -185,6 +187,148 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
         )
 
 
+def _align_modality_features_or_fail(
+    adata,
+    target_var_names: pd.Index,
+    modality_name: str,
+    split_name: str,
+    train_path: str,
+    source_path: str,
+):
+    """Ensure modality features are compatible with model training features.
+
+    If sets match but order differs, reorder to target_var_names.
+    If sets differ, raise an actionable error for rebuilding test/masked data.
+    """
+    current = pd.Index(adata.var_names.astype(str))
+    target = pd.Index(target_var_names.astype(str))
+
+    if current.equals(target):
+        return adata
+
+    same_set = (
+        len(current) == len(target)
+        and current.is_unique
+        and target.is_unique
+        and current.difference(target).empty
+        and target.difference(current).empty
+    )
+    if same_set:
+        print(
+            f"[DATA/{split_name}] Reordering {modality_name} features to match TRAIN model registry."
+        )
+        return adata[:, target].copy()
+
+    missing = target.difference(current)
+    extra = current.difference(target)
+    missing_preview = missing[:5].tolist()
+    extra_preview = extra[:5].tolist()
+
+    raise ValueError(
+        f"[DATA/{split_name}] Incompatible {modality_name} feature schema for model transfer. "
+        f"TRAIN has {len(target)} features, input has {len(current)} features. "
+        f"Missing-from-input={len(missing)} (example: {missing_preview}); "
+        f"extra-in-input={len(extra)} (example: {extra_preview}). "
+        "This usually means TRAIN and TEST/MASKED files were built with different data-prep logic. "
+        f"TRAIN file: {train_path}; input file: {source_path}. "
+        "Rebuild evaluation inputs from the same TRAIN source, e.g.: "
+        f"python scripts/create_test_split.py --train-path {train_path} "
+        "--output-path data/processed/splicevi_test_compatible.h5mu --test-frac 0.1"
+    )
+
+
+def _ensure_feature_compatibility_or_fail(
+    mdata,
+    target_rna_var_names: pd.Index,
+    target_splicing_var_names: pd.Index,
+    split_name: str,
+    train_path: str,
+    source_path: str,
+):
+    """Align feature order or fail fast when feature sets are incompatible."""
+    aligned_rna = _align_modality_features_or_fail(
+        mdata["rna"],
+        target_rna_var_names,
+        modality_name="RNA",
+        split_name=split_name,
+        train_path=train_path,
+        source_path=source_path,
+    )
+    aligned_splicing = _align_modality_features_or_fail(
+        mdata["splicing"],
+        target_splicing_var_names,
+        modality_name="splicing",
+        split_name=split_name,
+        train_path=train_path,
+        source_path=source_path,
+    )
+
+    if aligned_rna is mdata["rna"] and aligned_splicing is mdata["splicing"]:
+        return mdata
+
+    print(
+        f"[DATA/{split_name}] Rebuilding MuData container after feature alignment."
+    )
+    m_aligned = mu.MuData({"rna": aligned_rna, "splicing": aligned_splicing})
+    m_aligned.obs = mdata.obs.copy()
+    return m_aligned
+
+
+def _ensure_batch_key_available(mdata, batch_key: Optional[str], split_name: str):
+    """Resolve batch_key from any obs scope and propagate it to all expected obs tables."""
+    if batch_key is None:
+        return None
+
+    source_scope = None
+    source_series = None
+
+    if batch_key in mdata.obs.columns:
+        source_scope = "mdata.obs"
+        source_series = mdata.obs[batch_key]
+    elif "rna" in mdata.mod and batch_key in mdata["rna"].obs.columns:
+        source_scope = "rna.obs"
+        source_series = mdata["rna"].obs[batch_key]
+    elif "splicing" in mdata.mod and batch_key in mdata["splicing"].obs.columns:
+        source_scope = "splicing.obs"
+        source_series = mdata["splicing"].obs[batch_key]
+
+    if source_series is None:
+        global_cols = list(mdata.obs.columns)
+        rna_cols = list(mdata["rna"].obs.columns) if "rna" in mdata.mod else []
+        splicing_cols = list(mdata["splicing"].obs.columns) if "splicing" in mdata.mod else []
+        raise ValueError(
+            f"[MODEL/{split_name}] batch_key '{batch_key}' not found in any obs scope. "
+            f"mdata.obs sample={global_cols[:20]}; "
+            f"rna.obs sample={rna_cols[:20]}; "
+            f"splicing.obs sample={splicing_cols[:20]}"
+        )
+
+    print(
+        f"[MODEL/{split_name}] Using batch_key '{batch_key}' from {source_scope}; "
+        "propagating to all obs scopes."
+    )
+
+    def _propagate_one(obs_df, scope_name):
+        aligned = source_series.reindex(obs_df.index)
+        obs_df[batch_key] = aligned.values
+        n_missing = int(aligned.isna().sum())
+        if n_missing > 0:
+            print(
+                f"[MODEL/{split_name}] WARNING: {n_missing} missing values for "
+                f"'{batch_key}' after propagation to {scope_name}."
+            )
+
+    _propagate_one(mdata.obs, "mdata.obs")
+    if "rna" in mdata.mod:
+        _propagate_one(mdata["rna"].obs, "rna.obs")
+    if "splicing" in mdata.mod:
+        _propagate_one(mdata["splicing"].obs, "splicing.obs")
+
+    n_batch_categories = int(mdata.obs[batch_key].astype("string").nunique(dropna=False))
+    print(f"[MODEL/{split_name}] batch_key '{batch_key}' categories: {n_batch_categories}")
+    return n_batch_categories
+
+
 # ---------------------------------------------------------------------
 # Evaluation helper: train/test split metrics
 # ---------------------------------------------------------------------
@@ -229,6 +373,7 @@ def evaluate_split(
     model,
     umap_color_key: str,
     cell_type_classification_key: str,
+    age_target_col: str,
     Z_type: str = "joint",
     wandb=None,
     precomputed_Z: Optional[np.ndarray] = None,
@@ -339,21 +484,26 @@ def evaluate_split(
         )
 
     # Age regression tasks
-    if "age_numeric" in mdata.obs:
-        print(f"[EVAL/{name}-{Z_type}] Running age R² regression tasks...")
-        ages_full = mdata.obs["age_numeric"].astype(float).values
-        target_ages = np.array([3.0, 18.0, 24.0], dtype=float)
-        mask_age = np.isin(ages_full, target_ages)
+    age_candidates = []
+    for candidate in [age_target_col, "age_days", "age_numeric"]:
+        if candidate and candidate not in age_candidates:
+            age_candidates.append(candidate)
+    age_col = next((c for c in age_candidates if c in mdata.obs.columns), None)
+
+    if age_col is not None:
+        print(f"[EVAL/{name}-{Z_type}] Running linear regression for '{age_col}'...")
+        age_series = pd.to_numeric(mdata.obs[age_col], errors="coerce")
+        mask_age = age_series.notna().to_numpy()
         n_kept = int(mask_age.sum())
-        print(f"[EVAL/{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells at ages {target_ages.tolist()}")
+        print(f"[EVAL/{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells with valid '{age_col}'.")
 
         if n_kept < MIN_GROUP_N:
             print(
-                f"[EVAL/{name}-{Z_type}] Only {n_kept} cells with target ages; skipping age R² tasks."
+                f"[EVAL/{name}-{Z_type}] Only {n_kept} cells have valid '{age_col}'; skipping age regression."
             )
             return
 
-        ages = ages_full[mask_age]
+        ages = age_series.to_numpy(dtype=float)[mask_age]
         Z_use = Z[mask_age, :]
         obs_local = mdata.obs.iloc[np.where(mask_age)[0]].copy()
 
@@ -362,33 +512,42 @@ def evaluate_split(
             X_latent, ages, test_size=0.2, random_state=0
         )
 
-        # Global R²
+        # Global linear regression metrics
         if np.std(y_tr) == 0.0 or np.std(y_ev) == 0.0:
             print(
-                f"[EVAL/{name}-{Z_type}] Degenerate age variance after filtering; skipping global age R²."
+                f"[EVAL/{name}-{Z_type}] Degenerate '{age_col}' variance; skipping global regression metrics."
             )
         else:
-            ridge = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(X_tr, y_tr)
-            r2_age = ridge.score(X_ev, y_ev)
-            print(f"[EVAL/{name}-{Z_type}] Global age R²: {r2_age:.4f}")
+            linreg = LinearRegression().fit(X_tr, y_tr)
+            y_pred = linreg.predict(X_ev)
+            r2_age = float(linreg.score(X_ev, y_ev))
+            mae_age = float(mean_absolute_error(y_ev, y_pred))
+            rmse_age = float(np.sqrt(mean_squared_error(y_ev, y_pred)))
+
+            print(
+                f"[EVAL/{name}-{Z_type}] Global {age_col} metrics: "
+                f"R²={r2_age:.4f}, MAE={mae_age:.4f}, RMSE={rmse_age:.4f}"
+            )
             if wandb is not None:
                 wandb.log(
                     {
-                        f"real-{name}-{Z_type}/age_r2": r2_age,
-                        f"real-{name}-{Z_type}/age_n_cells": n_kept,
+                        f"real-{name}-{Z_type}/{age_col}_r2": r2_age,
+                        f"real-{name}-{Z_type}/{age_col}_mae": mae_age,
+                        f"real-{name}-{Z_type}/{age_col}_rmse": rmse_age,
+                        f"real-{name}-{Z_type}/{age_col}_n_cells": n_kept,
                     }
                 )
 
-        # Per (tissue | cell_type) R²
-        if "tissue" in obs_local:
-            ct_key = cell_type_classification_key
+        # Per (tissue | cell_type) regression metrics
+        if "tissue" in obs_local and cell_type_classification_key in obs_local:
             tissue_series = obs_local["tissue"].astype(str)
-            ct_series = obs_local[ct_key].astype(str)
+            ct_series = obs_local[cell_type_classification_key].astype(str)
             pair = tissue_series + " | " + ct_series
             pair_unique = pair.unique()
 
             print(
-                f"[EVAL/{name}-{Z_type}] Computing per-group age R² for {len(pair_unique)} tissue|cell_type pairs..."
+                f"[EVAL/{name}-{Z_type}] Computing per-group {age_col} regression for "
+                f"{len(pair_unique)} tissue|cell_type pairs..."
             )
 
             for p in pair_unique:
@@ -398,7 +557,6 @@ def evaluate_split(
 
                 Zg = X_latent[idx]
                 yg = ages[idx]
-
                 if np.std(yg) == 0.0:
                     continue
 
@@ -413,25 +571,31 @@ def evaluate_split(
                 ):
                     continue
 
-                try:
-                    rg = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(Ztr, ytr)
-                    r2g = rg.score(Zev, yev)
-                except Exception:
-                    continue
+                rg = LinearRegression().fit(Ztr, ytr)
+                yg_pred = rg.predict(Zev)
+                r2g = float(rg.score(Zev, yev))
+                maeg = float(mean_absolute_error(yev, yg_pred))
+                rmseg = float(np.sqrt(mean_squared_error(yev, yg_pred)))
 
                 AGE_R2_RECORDS.append(
                     {
                         "dataset": name,
                         "space": Z_type,
+                        "age_target_col": age_col,
                         "pair": p,
                         "tissue": p.split(" | ", 1)[0],
                         "cell_type": p.split(" | ", 1)[1],
-                        "r2": float(r2g),
+                        "r2": r2g,
+                        "mae": maeg,
+                        "rmse": rmseg,
                         "n": int(idx.size),
                     }
                 )
     else:
-        print(f"[EVAL/{name}-{Z_type}] No 'age_numeric' column found; skipping age R².")
+        print(
+            f"[EVAL/{name}-{Z_type}] No age target column found in obs "
+            f"(candidates={age_candidates}); skipping age regression."
+        )
 
 
 def run_cross_fold_classification(
@@ -840,7 +1004,16 @@ def build_argparser():
         default=None,
         help=(
             "List of .obs keys to color TRAIN UMAPs by. "
-            "If not provided, defaults to ['broad_cell_type', 'medium_cell_type' (if present)]."
+            "If not provided, defaults include cell-type keys and age_days (if present)."
+        ),
+    )
+    parser.add_argument(
+        "--age_target_col",
+        type=str,
+        default="age_days",
+        help=(
+            "obs column to use for age regression (default: age_days). "
+            "If missing, falls back to age_days/age_numeric when available."
         ),
     )
 
@@ -976,6 +1149,7 @@ def main():
         "evals": list(EVALS),
         "umap_top_n_celltypes": args.umap_top_n_celltypes,
         "umap_obs_keys": args.umap_obs_keys,
+        "age_target_col": args.age_target_col,
         "cross_fold_targets": cross_fold_targets,
         "cross_fold_splits": cross_fold_splits,
         "cross_fold_k": args.cross_fold_k,
@@ -1033,6 +1207,9 @@ def main():
     print(f"[DATA] TRAIN MuData loaded with mods: {list(mdata_train.mod.keys())}")
     print(f"[DATA] TRAIN 'rna' n_obs: {mdata_train['rna'].n_obs}, n_vars: {mdata_train['rna'].n_vars}")
 
+    train_rna_var_names = pd.Index(mdata_train["rna"].var_names.astype(str))
+    train_splicing_var_names = pd.Index(mdata_train["splicing"].var_names.astype(str))
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_train, args.mapping_csv)
 
@@ -1049,6 +1226,8 @@ def main():
     if "X_library_size" in mdata_train["rna"].obsm_keys():
         print("[DATA] Copying TRAIN RNA 'X_library_size' from .obsm to .obs...")
         mdata_train["rna"].obs["X_library_size"] = mdata_train["rna"].obsm["X_library_size"]
+
+    _ensure_batch_key_available(mdata_train, batch_key, split_name="TRAIN")
 
     print("[MODEL] Setting up SPLICEVI on TRAIN MuData ...")
     SPLICEVI.setup_mudata(
@@ -1128,6 +1307,8 @@ def main():
         umap_obs_keys = list(dict.fromkeys(args.umap_obs_keys))
         if "group_highlighted" not in umap_obs_keys:
             umap_obs_keys.insert(0, "group_highlighted")
+        if "age_days" in mdata_train.obs.columns and "age_days" not in umap_obs_keys:
+            umap_obs_keys.append("age_days")
         print(f"[UMAP] Using user-provided UMAP obs keys: {umap_obs_keys}")
     else:
         umap_obs_keys = ["group_highlighted"]
@@ -1135,6 +1316,8 @@ def main():
             umap_obs_keys.extend([umap_color_key, cell_type_classification_key])
         else:
             umap_obs_keys.append(umap_color_key)
+        if "age_days" in mdata_train.obs.columns and "age_days" not in umap_obs_keys:
+            umap_obs_keys.append("age_days")
         print(f"[UMAP] UMAP obs keys not provided; using defaults: {umap_obs_keys}")
 
     # Latent spaces
@@ -1599,6 +1782,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="joint",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("joint"),
@@ -1609,6 +1793,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="expression",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("expression"),
@@ -1619,6 +1804,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("splicing"),
@@ -1662,12 +1848,23 @@ def main():
     print(f"[DATA] TEST MuData loaded with mods: {list(mdata_test.mod.keys())}")
     print(f"[DATA] TEST 'rna' n_obs: {mdata_test['rna'].n_obs}, n_vars: {mdata_test['rna'].n_vars}")
 
+    mdata_test = _ensure_feature_compatibility_or_fail(
+        mdata_test,
+        train_rna_var_names,
+        train_splicing_var_names,
+        split_name="TEST",
+        train_path=args.train_mdata_path,
+        source_path=args.test_mdata_path,
+    )
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_test, args.mapping_csv)
 
     if "X_library_size" in mdata_test["rna"].obsm_keys():
         print("[DATA] Copying TEST RNA 'X_library_size' from .obsm to .obs...")
         mdata_test["rna"].obs["X_library_size"] = mdata_test["rna"].obsm["X_library_size"]
+
+    _ensure_batch_key_available(mdata_test, batch_key, split_name="TEST")
 
     print("[MODEL] Setting up SPLICEVI on TEST MuData ...")
     SPLICEVI.setup_mudata(
@@ -1709,6 +1906,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="joint",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("joint"),
@@ -1719,6 +1917,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="expression",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("expression"),
@@ -1729,6 +1928,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("splicing"),
@@ -1848,6 +2048,16 @@ def main():
                 mdata_masked.mod["splicing"].obs.rename(
                 columns={"donor_id": "mouse.id"},
                 inplace=True)
+
+                mdata_masked = _ensure_feature_compatibility_or_fail(
+                    mdata_masked,
+                    train_rna_var_names,
+                    train_splicing_var_names,
+                    split_name=f"IMPUTE/{tag}",
+                    train_path=args.train_mdata_path,
+                    source_path=masked_path,
+                )
+
                 print(
                     f"[EVAL/IMPUTE/{tag}] Masked MuData loaded. 'rna' n_obs: {mdata_masked['rna'].n_obs}"
                 )
@@ -1863,6 +2073,12 @@ def main():
                     mdata_masked["rna"].obs["X_library_size"] = mdata_masked["rna"].obsm[
                         "X_library_size"
                     ]
+
+                _ensure_batch_key_available(
+                    mdata_masked,
+                    batch_key,
+                    split_name=f"IMPUTE/{tag}",
+                )
 
                 print(f"[EVAL/IMPUTE/{tag}] Setting up SPLICEVI on masked MuData...")
                 SPLICEVI.setup_mudata(

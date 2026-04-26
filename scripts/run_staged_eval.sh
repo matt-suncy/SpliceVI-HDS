@@ -48,7 +48,7 @@ MODE=""
 MODEL_DIR=""
 TRAIN_H5MU=""
 TEST_H5MU=""
-BATCH_KEY="mouse.id"
+BATCH_KEY="seq_batch"
 OUTPUT_BASE="logs/eval_runs"
 MIN_ATSE_COUNT=15
 MASKED_RESAMPLED=false
@@ -213,8 +213,82 @@ else
   CROSS_FOLD_SPLITS="both"
 fi
 
-UMAP_OBS_KEYS=(broad_cell_type)
-CROSS_FOLD_TARGETS=(broad_cell_type mouse.id tissue_celltype tissue)
+mapfile -t _KEY_LINES < <(
+  python - "$TRAIN_H5MU" <<'PY'
+import sys
+import mudata as mu
+
+path = sys.argv[1]
+m = mu.read_h5mu(path, backed="r")
+cols = list(m["rna"].obs.columns)
+
+preferred_umap = [
+    "age_days",
+    "broad_cell_type",
+    "medium_cell_type",
+    "class",
+    "subclass",
+    "cluster",
+    "cell_type",
+    "tissue",
+]
+preferred_cross = [
+    "broad_cell_type",
+    "medium_cell_type",
+    "mouse.id",
+    "tissue_celltype",
+    "tissue",
+    "class",
+    "subclass",
+    "cluster",
+    "cell_type",
+    "batch",
+]
+
+umap = [k for k in preferred_umap if k in cols]
+if not umap and cols:
+    umap = [cols[0]]
+
+cross = [k for k in preferred_cross if k in cols]
+if not cross:
+    if "mouse.id" in cols:
+        cross = ["mouse.id"]
+    elif umap:
+        cross = [umap[0]]
+    elif cols:
+        cross = [cols[0]]
+
+print("UMAP=" + " ".join(umap[:3]))
+print("CROSS=" + " ".join(cross))
+PY
+)
+
+UMAP_OBS_KEYS=()
+CROSS_FOLD_TARGETS=()
+for _line in "${_KEY_LINES[@]}"; do
+  case "$_line" in
+    UMAP=*)
+      _vals="${_line#UMAP=}"
+      if [[ -n "$_vals" ]]; then
+        read -r -a UMAP_OBS_KEYS <<< "$_vals"
+      fi
+      ;;
+    CROSS=*)
+      _vals="${_line#CROSS=}"
+      if [[ -n "$_vals" ]]; then
+        read -r -a CROSS_FOLD_TARGETS <<< "$_vals"
+      fi
+      ;;
+  esac
+done
+
+if [[ ${#UMAP_OBS_KEYS[@]} -eq 0 ]]; then
+  UMAP_OBS_KEYS=(group_highlighted)
+fi
+if [[ ${#CROSS_FOLD_TARGETS[@]} -eq 0 ]]; then
+  CROSS_FOLD_TARGETS=(mouse.id)
+fi
+
 CROSS_FOLD_CLASSIFIERS=(logreg)
 CROSS_FOLD_METRICS=(accuracy f1_weighted precision_weighted recall_weighted)
 
@@ -265,6 +339,8 @@ echo "[RUN] Test MuData         : ${TEST_H5MU}"
 echo "[RUN] Output run dir      : ${RUN_DIR}"
 echo "[RUN] Figure dir          : ${FIG_DIR}"
 echo "[RUN] Evals               : ${EVALS[*]}"
+echo "[RUN] UMAP obs keys       : ${UMAP_OBS_KEYS[*]}"
+echo "[RUN] Cross-fold targets  : ${CROSS_FOLD_TARGETS[*]}"
 echo "[RUN] Masked files        : ${#MASKED_H5MU_PATHS[@]}"
 echo "=============================================================="
 
