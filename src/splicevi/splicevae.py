@@ -21,7 +21,7 @@ from .partialvae import PartialEncoderEDDIFaster, LinearDecoder, group_logsumexp
 # ---------------------------------------------------------------------------
 # Latent combination modules
 # ---------------------------------------------------------------------------
-_SAMPLE_BASED_MIXERS = {"sum", "product", "gating", "cross_attention", "mlp"}
+_LEARNED_PARAM_MIXERS = {"gating", "cross_attention", "mlp"}
 
 
 class SumMixer(nn.Module):
@@ -44,6 +44,13 @@ class GatingMixer(nn.Module):
         g = torch.sigmoid(self.gate(torch.cat([z_as, z_ge], dim=-1)))
         return g * z_as + (1 - g) * z_ge
 
+    def mix_params(self, mu_as, mu_ge, v_as, v_ge):
+        """Parameter-space mixing: gate computed from means, applied to both mean and variance."""
+        g = torch.sigmoid(self.gate(torch.cat([mu_as, mu_ge], dim=-1)))
+        mu = g * mu_as + (1 - g) * mu_ge
+        v  = (g * v_as  + (1 - g) * v_ge).clamp(min=1e-6)
+        return mu, v
+
 
 class CrossAttentionMixer(nn.Module):
     """Per-dim token attention: each latent dim is a token; z_as (AS) queries z_ge (GE)."""
@@ -60,13 +67,30 @@ class CrossAttentionMixer(nn.Module):
         out, _ = self.attn(Q, K, V)  # (B, Z, 1)
         return out.squeeze(-1)       # (B, Z)
 
+    def mix_params(self, mu_as, mu_ge, v_as, v_ge):
+        """Parameter-space mixing: attention weights from means reused for log-variances."""
+        mu_out = self.forward(mu_as, mu_ge)
+        # Reuse same Q/K (from means) but use log(v_ge) as values so output stays in log-space.
+        Q = mu_as.unsqueeze(-1)
+        K = mu_ge.unsqueeze(-1)
+        V = v_ge.log().unsqueeze(-1)
+        log_v_out, _ = self.attn(Q, K, V)
+        v_out = log_v_out.squeeze(-1).exp().clamp(min=1e-6)
+        return mu_out, v_out
+
 
 class MLPMixer(nn.Module):
     """Concatenate both latents, pass through a two-layer MLP, project back to n_latent."""
     def __init__(self, n_latent, n_hidden=128):
         super().__init__()
-        # n_hidden = n_hidden or n_latent * 2
         self.net = nn.Sequential(
+            nn.Linear(2 * n_latent, n_hidden),
+            nn.ReLU(),
+            nn.Linear(n_hidden, n_latent),
+        )
+        # Separate network for log-variance mixing; mean net is unconstrained so cannot
+        # be reused directly for variances which must be positive after exp.
+        self.net_v = nn.Sequential(
             nn.Linear(2 * n_latent, n_hidden),
             nn.ReLU(),
             nn.Linear(n_hidden, n_latent),
@@ -74,6 +98,12 @@ class MLPMixer(nn.Module):
 
     def forward(self, z_as, z_ge):
         return self.net(torch.cat([z_as, z_ge], dim=-1))
+
+    def mix_params(self, mu_as, mu_ge, v_as, v_ge):
+        """Parameter-space mixing: separate MLPs for mean and log-variance."""
+        mu    = self.net(torch.cat([mu_as, mu_ge], dim=-1))
+        log_v = self.net_v(torch.cat([v_as.log(), v_ge.log()], dim=-1))
+        return mu, log_v.exp().clamp(min=1e-6)
 
 
 class LibrarySizeEncoder(torch.nn.Module):
@@ -522,8 +552,8 @@ class SPLICEVAE(BaseModuleClass):
             self.register_buffer("mod_weights", torch.ones(max_n_modalities))
         elif modality_weights == "universal":
             self.mod_weights = torch.nn.Parameter(torch.ones(max_n_modalities))
-        elif modality_weights in _SAMPLE_BASED_MIXERS:
-            # new mixers don't use mod_weights; register a small buffer to avoid a
+        elif modality_weights in (*_LEARNED_PARAM_MIXERS, "sum", "product"):
+            # these mixers don't use mod_weights; register a small buffer to avoid a
             # large unused per-cell parameter
             self.register_buffer("mod_weights", torch.ones(max_n_modalities))
         else:
@@ -670,14 +700,15 @@ class SPLICEVAE(BaseModuleClass):
 
 
         # mix representations
+        # Learned-parameter mixers (gating/cross_attention/mlp) are excluded from
+        # warmup routing so their networks receive gradients from epoch 0.
         warmup_only_splicing = (
-            self.modality_weights not in ("concatenate", *_SAMPLE_BASED_MIXERS)
+            self.modality_weights not in ("concatenate", *_LEARNED_PARAM_MIXERS)
             and float(self.cross_gate.item()) < 1.0
         )
         if warmup_only_splicing:
-            # During warmup, route only the splicing posterior into the shared latent.
-            # This makes both decoders use splicing information in the generative step.
-
+            # During warmup, randomly route one modality's posterior into the shared latent.
+            # Lets each encoder stabilise before the joint mixing begins.
             result = random.choice(["splicing", "expression"])
             if result == "splicing":
                 qz_m = qzm_spl
@@ -686,14 +717,20 @@ class SPLICEVAE(BaseModuleClass):
                 qz_m = qzm_expr
                 qz_v = qzv_expr
 
-        elif self.modality_weights in _SAMPLE_BASED_MIXERS:
-            # Mix already-sampled latents directly.
-            # KL is computed from individual posteriors in loss() (kl_mode="individual").
-            # z_spl passed first (AS = Q), z_expr second (GE = K/V) for cross-attention.
-            # TODO: n_samples > 1 not yet supported for sample-based mixers.
-            z_joint = self.mixer(z_spl, z_expr)
-            qz_m = z_joint
-            qz_v = torch.ones_like(z_joint)  # sentinel; not used for KL in this mode
+        elif self.modality_weights == "sum":
+            # Exact: sum of two independent Gaussians N(μ1,v1)+N(μ2,v2) = N(μ1+μ2, v1+v2)
+            qz_m = qzm_spl + qzm_expr
+            qz_v = (qzv_spl + qzv_expr).clamp(min=1e-6)
+
+        elif self.modality_weights == "product":
+            # Exact: E[z1·z2]=μ1μ2, Var[z1·z2]=μ1²v2+μ2²v1+v1v2 for independent Gaussians
+            qz_m = qzm_spl * qzm_expr
+            qz_v = (qzm_spl**2 * qzv_expr + qzm_expr**2 * qzv_spl + qzv_spl * qzv_expr).clamp(min=1e-6)
+
+        elif self.modality_weights in _LEARNED_PARAM_MIXERS:
+            # Parameter-space heuristic: mixer operates on posterior statistics directly.
+            # Gate/attention/MLP applied to means; same weights reused for variance (see mix_params).
+            qz_m, qz_v = self.mixer.mix_params(qzm_spl, qzm_expr, qzv_spl, qzv_expr)
 
         elif self.modality_weights == "concatenate":
             # just glue the two posterior stats end-to-end
@@ -727,26 +764,15 @@ class SPLICEVAE(BaseModuleClass):
             libsize_expr = unsqz(libsize_expr, n_samples)
 
 
-        # sample from the mixed representation
-        # For sample-based mixers (outside warmup), z_joint is already the latent sample.
-        # For all other modes, sample from the mixed posterior N(qz_m, sqrt(qz_v)).
-        if self.modality_weights in _SAMPLE_BASED_MIXERS and not warmup_only_splicing:
-            z = z_joint  # already sampled; mixer output is the latent
-        else:
-            untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
-            z = self.z_encoder_expression.z_transformation(untran_z)
-
-        kl_mode = (
-            "individual"
-            if self.modality_weights in _SAMPLE_BASED_MIXERS and not warmup_only_splicing
-            else "joint"
-        )
+        # Sample from the mixed posterior N(qz_m, sqrt(qz_v)).
+        # All mixer modes now produce (qz_m, qz_v) in parameter space.
+        untran_z = Normal(qz_m, qz_v.sqrt()).rsample()
+        z = self.z_encoder_expression.z_transformation(untran_z)
 
         return {
             "z": z,
             "qz_m": qz_m,
             "qz_v": qz_v,
-            "kl_mode": kl_mode,
             "z_expr": z_expr,
             "qzm_expr": qzm_expr,
             "qzv_expr": qzv_expr,
@@ -963,19 +989,11 @@ class SPLICEVAE(BaseModuleClass):
         recon_loss_splicing = rl_splicing
         recon_loss = recon_loss_expression + recon_loss_splicing
 
-        # Compute KL divergence between approximate posterior and prior.
-        # For sample-based mixers (kl_mode="individual"), sum KLs from each encoder's
-        # posterior since z_joint has no closed-form distribution.
-        # For all other modes (kl_mode="joint"), use the mixed posterior directly.
-        if inference_outputs.get("kl_mode", "joint") == "individual":
-            kl_div_z = (
-                kld(Normal(inference_outputs["qzm_expr"], torch.sqrt(inference_outputs["qzv_expr"])), Normal(0, 1)).sum(dim=1)
-                + kld(Normal(inference_outputs["qzm_spl"], torch.sqrt(inference_outputs["qzv_spl"])), Normal(0, 1)).sum(dim=1)
-            )
-        else:
-            qz_m = inference_outputs["qz_m"]
-            qz_v = inference_outputs["qz_v"]
-            kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
+        # Compute KL divergence between the mixed posterior and the prior.
+        # All mixer modes produce (qz_m, qz_v) in parameter space, so a single KL suffices.
+        qz_m = inference_outputs["qz_m"]
+        qz_v = inference_outputs["qz_v"]
+        kl_div_z = kld(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
 
         # Compute the KL divergence for paired data, passing in the precomputed masks
         kl_div_paired = self._compute_mod_penalty(
