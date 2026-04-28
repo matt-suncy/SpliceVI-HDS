@@ -120,6 +120,23 @@ python train_splicevi.py \
   --batch_key seq_batch
 ```
 
+5. (Optional, for imputation eval) Generate masked TEST artifacts:
+
+```bash
+python scripts/multinomial_resampling_masking.py \
+  --input-test-h5mu data/processed/splicevi_custom_input_test30.h5mu \
+  --output-dir data/processed/masked_impute \
+  --mask-fracs 0.25 0.50 \
+  --mode resampled
+```
+
+This writes files like:
+- `RESAMPLED_25_PERCENT_<test_stem>.h5mu`
+- `RESAMPLED_50_PERCENT_<test_stem>.h5mu`
+
+Use `--mode legacy` (or `--mode both`) if you need the legacy masked layers
+(`junc_ratio_masked_original`, `junc_ratio_masked_bin_mask`).
+
 One-command helper:
 
 ```bash
@@ -142,7 +159,7 @@ bash scripts/run_staged_eval.sh \
   --model-dir models/custom_baseline_run \
   --train-h5mu data/processed/train_splicevi_input.h5mu \
   --test-h5mu data/processed/test_splicevi_input.h5mu \
-  --masked-h5mu data/processed/test_masked_25.h5mu \
+  --masked-h5mu data/processed/masked_impute/RESAMPLED_25_PERCENT_test_splicevi_input.h5mu \
   --masked-resampled
 ```
 
@@ -154,8 +171,8 @@ bash scripts/run_staged_eval.sh \
   --model-dir models/custom_baseline_run \
   --train-h5mu data/processed/train_splicevi_input.h5mu \
   --test-h5mu data/processed/test_splicevi_input.h5mu \
-  --masked-h5mu data/processed/test_masked_25.h5mu \
-  --masked-h5mu data/processed/test_masked_50.h5mu \
+  --masked-h5mu data/processed/masked_impute/RESAMPLED_25_PERCENT_test_splicevi_input.h5mu \
+  --masked-h5mu data/processed/masked_impute/RESAMPLED_50_PERCENT_test_splicevi_input.h5mu \
   --masked-resampled
 ```
 
