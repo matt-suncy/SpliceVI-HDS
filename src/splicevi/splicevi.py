@@ -365,7 +365,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         n_junctions: int | None = None,
 
         # --- Modality mixing ---
-        modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
+        modality_weights: Literal["equal", "cell", "universal", "concatenate", "sum", "product", "gating", "cross_attention", "cross_attention_reverse", "mlp"] = "equal",
         modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
 
         # --- Shared SCVI-style encoder/decoder hyperparameters ---

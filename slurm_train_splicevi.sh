@@ -1,4 +1,13 @@
 #!/bin/bash
+#SBATCH --job-name=splicevi_train
+#SBATCH --output=logs/splicevi_train_%j.out
+#SBATCH --error=logs/splicevi_train_%j.err
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=4
+#SBATCH --exclude=ins082,ins093,ins092,ins084,ins090,ins085
+#SBATCH --time=03:00:00
+#SBATCH -A pmg 
 
 
 set -euo pipefail
@@ -54,7 +63,7 @@ DROPOUT_RATE=0.01       # Model dropout rate
 SPLICING_LOSS_TYPE="dirichlet_multinomial"  # binomial | beta_binomial | dirichlet_multinomial
 
 # 4) Optional architecture knobs (SPLICEVI __init__ parameters)
-MODALITY_WEIGHTS="equal"             # equal | cell | universal | concatenate
+MODALITY_WEIGHTS=$1             # equal | cell | universal | concatenate
 MODALITY_PENALTY="None"          # Jeffreys | MMD | None
 N_LAYERS_ENCODER=2
 N_LAYERS_DECODER=2                   # not used if linear
@@ -90,8 +99,8 @@ GRADIENT_CLIPPING_MAX_NORM=5.0
 USE_WANDB=true                       # Set to "false" to disable W&B logging
 WANDB_PROJECT="SpliceVI-HDS"      # Required if USE_WANDB=true
 WANDB_ENTITY=""                      # Optional: W&B entity (team). Leave empty if not used.
-WANDB_GROUP="splicevi_basic"    # Optional group label
-WANDB_RUN_NAME_PREFIX="basic_train"  # Prefix for W&B run names
+WANDB_GROUP="splicevi_${MODALITY_WEIGHTS}"    # Optional group label
+WANDB_RUN_NAME_PREFIX="${MODALITY_WEIGHTS}_train"  # Prefix for W&B run names
 WANDB_LOG_FREQ=1000                  # Log frequency for wandb.watch
 
 
@@ -100,13 +109,13 @@ WANDB_LOG_FREQ=1000                  # Log frequency for wandb.watch
 #######################################
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-RUN_NAME="splicevi_basic_${TIMESTAMP}"
+RUN_NAME="splicevi_${MODALITY_WEIGHTS}_${TIMESTAMP}"
 
 MODEL_DIR="${MODEL_DIR_BASE}/${RUN_NAME}"
 mkdir -p "${MODEL_DIR}"
 
 echo "=================================================================="
-echo "[JOB] SPLICEVI basic training job"
+echo "[JOB] SPLICEVI training with mixing strategy: ${MODALITY_WEIGHTS}"
 echo "[JOB] Slurm job ID          : ${SLURM_JOB_ID:-N/A}"
 echo "[JOB] Run name              : ${RUN_NAME}"
 echo "[JOB] Training MuData path  : ${TRAIN_MDATA_PATH}"

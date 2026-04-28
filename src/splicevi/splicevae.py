@@ -21,7 +21,7 @@ from .partialvae import PartialEncoderEDDIFaster, LinearDecoder, group_logsumexp
 # ---------------------------------------------------------------------------
 # Latent combination modules
 # ---------------------------------------------------------------------------
-_LEARNED_PARAM_MIXERS = {"gating", "cross_attention", "mlp"}
+_LEARNED_PARAM_MIXERS = {"gating", "cross_attention", "cross_attention_reverse", "mlp"}
 
 
 class SumMixer(nn.Module):
@@ -53,28 +53,49 @@ class GatingMixer(nn.Module):
 
 
 class CrossAttentionMixer(nn.Module):
-    """Per-dim token attention: each latent dim is a token; z_as (AS) queries z_ge (GE)."""
-    def __init__(self, n_latent):
+    """Per-dim token attention: each latent dim is a token.
+
+    reverse=False (default): AS queries GE — Attention(Q=z_as, K=z_ge, V=z_ge)
+    reverse=True:            GE queries AS — Attention(Q=z_ge, K=z_as, V=z_as)
+
+    Two independent attention heads are used: self.attn for the mean, self.attn_v for
+    the log-variance. This mirrors MLPMixer's separate net/net_v design and allows the
+    model to learn different attention patterns for location vs. uncertainty.
+    """
+    def __init__(self, n_latent, reverse: bool = False):
         super().__init__()
         # embed_dim=1: each token is a scalar (one latent dimension)
-        self.attn = nn.MultiheadAttention(embed_dim=1, num_heads=1, batch_first=True)
+        self.attn   = nn.MultiheadAttention(embed_dim=1, num_heads=1, batch_first=True)
+        self.attn_v = nn.MultiheadAttention(embed_dim=1, num_heads=1, batch_first=True)
+        self.reverse = reverse
 
     def forward(self, z_as, z_ge):
         # (B, Z) -> (B, Z, 1): treat each latent dim as a token of size 1
-        Q = z_as.unsqueeze(-1)  # (B, Z, 1)
-        K = z_ge.unsqueeze(-1)
-        V = z_ge.unsqueeze(-1)
+        if self.reverse:  # GE queries AS
+            Q = z_ge.unsqueeze(-1)
+            K = z_as.unsqueeze(-1)
+            V = z_as.unsqueeze(-1)
+        else:             # AS queries GE (original)
+            Q = z_as.unsqueeze(-1)
+            K = z_ge.unsqueeze(-1)
+            V = z_ge.unsqueeze(-1)
         out, _ = self.attn(Q, K, V)  # (B, Z, 1)
         return out.squeeze(-1)       # (B, Z)
 
     def mix_params(self, mu_as, mu_ge, v_as, v_ge):
-        """Parameter-space mixing: attention weights from means reused for log-variances."""
-        mu_out = self.forward(mu_as, mu_ge)
-        # Reuse same Q/K (from means) but use log(v_ge) as values so output stays in log-space.
-        Q = mu_as.unsqueeze(-1)
-        K = mu_ge.unsqueeze(-1)
-        V = v_ge.log().unsqueeze(-1)
-        log_v_out, _ = self.attn(Q, K, V)
+        """Parameter-space mixing: separate attention heads for mean and log-variance."""
+        mu_out = self.forward(mu_as, mu_ge)  # uses self.attn
+        lv_as = v_as.log()
+        lv_ge = v_ge.log()
+        if self.reverse:  # GE queries AS
+            Q = lv_ge.unsqueeze(-1)
+            K = lv_as.unsqueeze(-1)
+            V = lv_as.unsqueeze(-1)
+        else:             # AS queries GE
+            Q = lv_as.unsqueeze(-1)
+            K = lv_ge.unsqueeze(-1)
+            V = lv_ge.unsqueeze(-1)
+        log_v_out, _ = self.attn_v(Q, K, V)  # independent head for variance
         v_out = log_v_out.squeeze(-1).exp().clamp(min=1e-6)
         return mu_out, v_out
 
@@ -353,7 +374,7 @@ class SPLICEVAE(BaseModuleClass):
         max_nobs: int = -1,
 
         # --- Modality mixing ---
-        modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
+        modality_weights: Literal["equal", "cell", "universal", "concatenate", "sum", "product", "gating", "cross_attention", "cross_attention_reverse", "mlp"] = "equal",
         modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
 
         # --- Misc ---
@@ -565,16 +586,37 @@ class SPLICEVAE(BaseModuleClass):
         # ---------------- Latent Mixer ----------------
         if modality_weights == "sum":
             self.mixer = SumMixer()
+            print(f"[MIXER] Initialized SumMixer (modality_weights='{modality_weights}')")
         elif modality_weights == "product":
             self.mixer = ProductMixer()
+            print(f"[MIXER] Initialized ProductMixer (modality_weights='{modality_weights}')")
         elif modality_weights == "gating":
             self.mixer = GatingMixer(self.encoder_latent_dim)
+            print(
+                f"[MIXER] Initialized GatingMixer (modality_weights='{modality_weights}', "
+                f"latent_dim={self.encoder_latent_dim})"
+            )
         elif modality_weights == "cross_attention":
-            self.mixer = CrossAttentionMixer(self.encoder_latent_dim)
+            self.mixer = CrossAttentionMixer(self.encoder_latent_dim, reverse=False)
+            print(
+                f"[MIXER] Initialized CrossAttentionMixer (modality_weights='{modality_weights}', "
+                f"latent_dim={self.encoder_latent_dim})"
+            )
+        elif modality_weights == "cross_attention_reverse":
+            self.mixer = CrossAttentionMixer(self.encoder_latent_dim, reverse=True)
+            print(
+                f"[MIXER] Initialized CrossAttentionMixer reverse (modality_weights='{modality_weights}', "
+                f"latent_dim={self.encoder_latent_dim})"
+            )
         elif modality_weights == "mlp":
             self.mixer = MLPMixer(self.encoder_latent_dim)
+            print(
+                f"[MIXER] Initialized MLPMixer (modality_weights='{modality_weights}', "
+                f"latent_dim={self.encoder_latent_dim})"
+            )
         else:
             self.mixer = None
+            print(f"[MIXER] No explicit mixer module (modality_weights='{modality_weights}')")
 
     def set_cross_gate(self, value: float):
         # value in [0,1]; keep as buffer so it's not optimized
