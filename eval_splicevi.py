@@ -35,8 +35,8 @@ import matplotlib.cm as cm
 import seaborn as sns
 
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
+from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.metrics import (
@@ -46,6 +46,7 @@ from sklearn.metrics import (
     f1_score,
     mean_absolute_error,
     mean_squared_error,
+    r2_score,
     silhouette_score,
     adjusted_mutual_info_score,
 )
@@ -491,7 +492,7 @@ def evaluate_split(
     age_col = next((c for c in age_candidates if c in mdata.obs.columns), None)
 
     if age_col is not None:
-        print(f"[EVAL/{name}-{Z_type}] Running linear regression for '{age_col}'...")
+        print(f"[EVAL/{name}-{Z_type}] Running ridge regression for '{age_col}'...")
         age_series = pd.to_numeric(mdata.obs[age_col], errors="coerce")
         mask_age = age_series.notna().to_numpy()
         n_kept = int(mask_age.sum())
@@ -512,21 +513,35 @@ def evaluate_split(
             X_latent, ages, test_size=0.2, random_state=0
         )
 
-        # Global linear regression metrics
+        # Global ridge regression metrics
         if np.std(y_tr) == 0.0 or np.std(y_ev) == 0.0:
             print(
                 f"[EVAL/{name}-{Z_type}] Degenerate '{age_col}' variance; skipping global regression metrics."
             )
         else:
-            linreg = LinearRegression().fit(X_tr, y_tr)
-            y_pred = linreg.predict(X_ev)
-            r2_age = float(linreg.score(X_ev, y_ev))
+            ridge = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(X_tr, y_tr)
+            y_pred = ridge.predict(X_ev)
+            r2_age = float(ridge.score(X_ev, y_ev))
             mae_age = float(mean_absolute_error(y_ev, y_pred))
             rmse_age = float(np.sqrt(mean_squared_error(y_ev, y_pred)))
 
             print(
                 f"[EVAL/{name}-{Z_type}] Global {age_col} metrics: "
                 f"R²={r2_age:.4f}, MAE={mae_age:.4f}, RMSE={rmse_age:.4f}"
+            )
+            AGE_R2_RECORDS.append(
+                {
+                    "dataset": name,
+                    "space": Z_type,
+                    "age_target_col": age_col,
+                    "pair": "__global__",
+                    "tissue": "all",
+                    "cell_type": "all",
+                    "r2": r2_age,
+                    "mae": mae_age,
+                    "rmse": rmse_age,
+                    "n": int(n_kept),
+                }
             )
             if wandb is not None:
                 wandb.log(
@@ -571,7 +586,7 @@ def evaluate_split(
                 ):
                     continue
 
-                rg = LinearRegression().fit(Ztr, ytr)
+                rg = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(Ztr, ytr)
                 yg_pred = rg.predict(Zev)
                 r2g = float(rg.score(Zev, yev))
                 maeg = float(mean_absolute_error(yev, yg_pred))
@@ -629,25 +644,34 @@ def run_cross_fold_classification(
         print("[CROSS-FOLD] No latent spaces provided; skipping.")
         return
 
-    metric_fns = {}
+    cls_metric_fns = {}
+    reg_metric_fns = {}
     for name in metrics:
         if name == "accuracy":
-            metric_fns[name] = accuracy_score
+            cls_metric_fns[name] = accuracy_score
         elif name == "f1_weighted":
-            metric_fns[name] = lambda yt, yp: f1_score(
+            cls_metric_fns[name] = lambda yt, yp: f1_score(
                 yt, yp, average="weighted", zero_division=0
             )
         elif name == "precision_weighted":
-            metric_fns[name] = lambda yt, yp: precision_score(
+            cls_metric_fns[name] = lambda yt, yp: precision_score(
                 yt, yp, average="weighted", zero_division=0
             )
         elif name == "recall_weighted":
-            metric_fns[name] = lambda yt, yp: recall_score(
+            cls_metric_fns[name] = lambda yt, yp: recall_score(
                 yt, yp, average="weighted", zero_division=0
+            )
+        elif name == "r2":
+            reg_metric_fns[name] = r2_score
+        elif name == "mae":
+            reg_metric_fns[name] = mean_absolute_error
+        elif name == "rmse":
+            reg_metric_fns[name] = lambda yt, yp: float(
+                np.sqrt(mean_squared_error(yt, yp))
             )
         else:
             print(f"[CROSS-FOLD] Unknown metric '{name}' requested; skipping it.")
-    if len(metric_fns) == 0:
+    if len(cls_metric_fns) == 0 and len(reg_metric_fns) == 0:
         print("[CROSS-FOLD] No valid metrics provided; skipping cross-fold.")
         return
 
@@ -674,15 +698,177 @@ def run_cross_fold_classification(
             )
         raise ValueError(f"Unsupported classifier '{name}'.")
 
+    def build_regressor(name: str):
+        if name == "ridge":
+            return make_pipeline(
+                StandardScaler(),
+                RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5),
+            )
+        raise ValueError(f"Unsupported regressor '{name}'.")
+
     for target in targets:
         if target not in mdata.obs.columns:
             print(f"[CROSS-FOLD] Target '{target}' missing in obs; skipping.")
             continue
 
-        labels_series_full = mdata.obs[target].astype("string").fillna("NA")
+        target_series = mdata.obs[target]
+        is_regression_target = target in {"age_days", "age", "age_numeric"}
+        if not is_regression_target:
+            numeric_probe = pd.to_numeric(target_series, errors="coerce")
+            finite_ratio = float(np.isfinite(numeric_probe.to_numpy()).mean())
+            if finite_ratio > 0.95 and int(pd.Series(numeric_probe).nunique(dropna=True)) >= 20:
+                is_regression_target = True
+
+        if is_regression_target:
+            y_all = pd.to_numeric(target_series, errors="coerce").to_numpy(dtype=float)
+            valid_mask = np.isfinite(y_all)
+            total_n_samples = int(y_all.size)
+            if not valid_mask.any():
+                print(f"[CROSS-FOLD] Target '{target}' has no finite values; skipping.")
+                continue
+            keep_indices = np.flatnonzero(valid_mask)
+            y = y_all[keep_indices]
+            n_samples = int(y.size)
+            if n_samples < max(k_folds, 10):
+                print(
+                    f"[CROSS-FOLD] Target '{target}' has too few valid samples for regression CV "
+                    f"(n={n_samples}, k={k_folds}); skipping."
+                )
+                continue
+
+            reg_candidates = [c for c in classifiers if c == "ridge"]
+            if len(reg_candidates) == 0:
+                print(
+                    f"[CROSS-FOLD] Target '{target}' is continuous, but no regression model "
+                    "requested (add 'ridge' to --cross_fold_classifiers); skipping."
+                )
+                continue
+            if len(reg_metric_fns) == 0:
+                print(
+                    f"[CROSS-FOLD] Target '{target}' is continuous but no regression metrics "
+                    "requested (use metrics from: r2, mae, rmse); skipping."
+                )
+                continue
+
+            k_use = min(k_folds, n_samples)
+            if k_use < 2:
+                print(
+                    f"[CROSS-FOLD] Target '{target}' does not have enough samples for k-fold; skipping."
+                )
+                continue
+            splits = list(KFold(n_splits=k_use, shuffle=True, random_state=42).split(y))
+            fold_scores: Dict[Tuple[str, str, str], List[float]] = {}
+
+            print(
+                f"[CROSS-FOLD] Regression target '{target}' | n={n_samples}, folds={k_use}"
+            )
+
+            for space_name in available_spaces:
+                Z_full = latent_spaces[space_name]
+                if Z_full.shape[0] != total_n_samples:
+                    print(
+                        f"[CROSS-FOLD] Latent '{space_name}' has {Z_full.shape[0]} rows but expected {total_n_samples}; skipping this space."
+                    )
+                    continue
+                Z = Z_full[keep_indices]
+
+                for reg_name in reg_candidates:
+                    for tr_idx, ev_idx in splits:
+                        reg_fit = build_regressor(reg_name)
+                        reg_fit.fit(Z[tr_idx], y[tr_idx])
+                        y_pred = reg_fit.predict(Z[ev_idx])
+                        y_true = y[ev_idx]
+                        for metric_name, metric_fn in reg_metric_fns.items():
+                            score = float(metric_fn(y_true, y_pred))
+                            fold_scores.setdefault(
+                                (reg_name, metric_name, space_name), []
+                            ).append(score)
+
+            for (reg_name, metric_name, space_name), scores in fold_scores.items():
+                mean_score = float(np.mean(scores))
+                std_score = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+                CROSS_FOLD_RECORDS.append(
+                    {
+                        "split": split_name,
+                        "target": target,
+                        "target_type": "regression",
+                        "classifier": reg_name,
+                        "space": space_name,
+                        "metric": metric_name,
+                        "mean": mean_score,
+                        "std": std_score,
+                        "n_folds": len(scores),
+                        "n_samples": n_samples,
+                        "n_classes": np.nan,
+                    }
+                )
+                print(
+                    f"[CROSS-FOLD] {split_name} | {target} | {reg_name} | {space_name} | "
+                    f"{metric_name}: {mean_score:.4f} ± {std_score:.4f} (n={len(scores)})"
+                )
+                if wandb is not None:
+                    wandb.log(
+                        {
+                            f"crossfold/{split_name}/{target}/{reg_name}/{space_name}/{metric_name}_mean": mean_score,
+                            f"crossfold/{split_name}/{target}/{reg_name}/{space_name}/{metric_name}_std": std_score,
+                        }
+                    )
+
+            for reg_name in reg_candidates:
+                for metric_name in reg_metric_fns.keys():
+                    for i in range(len(available_spaces)):
+                        for j in range(i + 1, len(available_spaces)):
+                            a = available_spaces[i]
+                            b = available_spaces[j]
+                            key_a = (reg_name, metric_name, a)
+                            key_b = (reg_name, metric_name, b)
+                            if key_a not in fold_scores or key_b not in fold_scores:
+                                continue
+                            scores_a = np.array(fold_scores[key_a], dtype=float)
+                            scores_b = np.array(fold_scores[key_b], dtype=float)
+                            if scores_a.size < 2 or scores_b.size < 2:
+                                pval = np.nan
+                                mean_diff = np.nan
+                            else:
+                                _, pval = ttest_rel(scores_a, scores_b)
+                                mean_diff = float(scores_a.mean() - scores_b.mean())
+                            CROSS_FOLD_SIGNIFICANCE.append(
+                                {
+                                    "split": split_name,
+                                    "target": target,
+                                    "target_type": "regression",
+                                    "classifier": reg_name,
+                                    "metric": metric_name,
+                                    "space_a": a,
+                                    "space_b": b,
+                                    "pvalue": float(pval) if pval is not None else np.nan,
+                                    "mean_diff_a_minus_b": mean_diff,
+                                    "n_folds": int(min(scores_a.size, scores_b.size)),
+                                }
+                            )
+                            print(
+                                f"[CROSS-FOLD] Significance {split_name} | {target} | {reg_name} | {metric_name} : "
+                                f"{a} vs {b} p={pval:.4e} (diff={mean_diff:.4f})"
+                            )
+            continue
+
+        labels_series_full = target_series.astype("string").fillna("NA")
         total_n_samples = int(labels_series_full.size)
         labels_series = labels_series_full
         keep_indices = np.arange(total_n_samples)
+        cls_candidates = [c for c in classifiers if c in {"logreg", "rf"}]
+        if len(cls_candidates) == 0:
+            print(
+                f"[CROSS-FOLD] Target '{target}' is categorical, but no classification model "
+                "requested (add logreg and/or rf to --cross_fold_classifiers); skipping."
+            )
+            continue
+        if len(cls_metric_fns) == 0:
+            print(
+                f"[CROSS-FOLD] Target '{target}' is categorical but no classification metrics "
+                "requested; skipping."
+            )
+            continue
 
         # Optionally drop singleton mice so StratifiedKFold has support.
         if target == "mouse.id":
@@ -750,7 +936,7 @@ def run_cross_fold_classification(
                 continue
             Z = Z_full[keep_indices]
 
-            for clf_name in classifiers:
+            for clf_name in cls_candidates:
                 # loop over each fold's train/validation indices
                 for fold_idx, (tr_idx, ev_idx) in enumerate(splits):
                     # build a fresh classifier instance per fold
@@ -761,7 +947,7 @@ def run_cross_fold_classification(
                     y_pred = clf_fit.predict(Z[ev_idx])
                     # true labels for the held-out fold
                     y_true = y[ev_idx]
-                    for metric_name, metric_fn in metric_fns.items():
+                    for metric_name, metric_fn in cls_metric_fns.items():
                         score = float(metric_fn(y_true, y_pred))
                         fold_scores.setdefault(
                             (clf_name, metric_name, space_name), []
@@ -814,6 +1000,7 @@ def run_cross_fold_classification(
                 {
                     "split": split_name,
                     "target": target,
+                    "target_type": "classification",
                     "classifier": clf_name,
                     "space": space_name,
                     "metric": metric_name,
@@ -844,8 +1031,8 @@ def run_cross_fold_classification(
             
 
         # Significance: paired t-tests between spaces for each classifier/metric
-        for clf_name in classifiers:
-            for metric_name in metric_fns.keys():
+        for clf_name in cls_candidates:
+            for metric_name in cls_metric_fns.keys():
                 for i in range(len(available_spaces)):
                     for j in range(i + 1, len(available_spaces)):
                         a = available_spaces[i]
@@ -867,6 +1054,7 @@ def run_cross_fold_classification(
                             {
                                 "split": split_name,
                                 "target": target,
+                                "target_type": "classification",
                                 "classifier": clf_name,
                                 "metric": metric_name,
                                 "space_a": a,
@@ -1060,16 +1248,31 @@ def build_argparser():
     parser.add_argument(
         "--cross_fold_classifiers",
         nargs="+",
-        choices=["logreg", "rf"],
+        choices=["logreg", "rf", "ridge"],
         default=["logreg", "rf"],
-        help="Classifiers to use for cross-fold evaluation (logreg=Logistic Regression, rf=Random Forest).",
+        help=(
+            "Models to use for cross-fold evaluation "
+            "(logreg/rf for classification targets, ridge for continuous targets like age_days)."
+        ),
     )
     parser.add_argument(
         "--cross_fold_metrics",
         nargs="+",
-        choices=["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"],
+        choices=[
+            "accuracy",
+            "f1_weighted",
+            "precision_weighted",
+            "recall_weighted",
+            "r2",
+            "mae",
+            "rmse",
+        ],
         default=["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"],
-        help="Metrics to report for cross-fold evaluation.",
+        help=(
+            "Metrics to report for cross-fold evaluation. "
+            "Classification targets use accuracy/f1/precision/recall; "
+            "continuous targets use r2/mae/rmse."
+        ),
     )
 
     # Optional W&B integration
@@ -1302,13 +1505,9 @@ def main():
     color_dict = {group: colors[i] for i, group in enumerate(top_groups)}
     color_dict["Other"] = (0.9, 0.9, 0.9, 1.0)
 
-    # UMAP obs keys list (always include highlighted groups first)
+    # UMAP obs keys list
     if args.umap_obs_keys is not None:
         umap_obs_keys = list(dict.fromkeys(args.umap_obs_keys))
-        if "group_highlighted" not in umap_obs_keys:
-            umap_obs_keys.insert(0, "group_highlighted")
-        if "age_days" in mdata_train.obs.columns and "age_days" not in umap_obs_keys:
-            umap_obs_keys.append("age_days")
         print(f"[UMAP] Using user-provided UMAP obs keys: {umap_obs_keys}")
     else:
         umap_obs_keys = ["group_highlighted"]
