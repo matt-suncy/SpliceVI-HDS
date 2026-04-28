@@ -137,6 +137,42 @@ This writes files like:
 Use `--mode legacy` (or `--mode both`) if you need the legacy masked layers
 (`junc_ratio_masked_original`, `junc_ratio_masked_bin_mask`).
 
+### How masked imputation evaluation is computed
+
+`eval_splicevi.py` evaluates imputation only when `masked_impute` is in `--evals`
+and masked files are passed via `--masked_test_mdata_paths`.
+
+For each masked file:
+
+1. Load masked MuData and enforce feature compatibility with training features.
+2. Run model inference with `get_normalized_splicing(...)` to predict PSI for all
+   cell-junction pairs.
+3. Build the evaluation mask:
+   - **Resampled mode** (`--masked_test_mdata_is_resampled`):
+     - ground truth = `splicing.layers['junc_ratio_original']`
+     - include entries where PSI `> 0`
+     - if `--impute_filter_boundary_psi` is set, further require PSI `< 1`
+     - if `--min_atse_count != -1`, further require
+       `splicing.layers['cell_by_cluster_matrix_original'] >= min_atse_count`
+   - **Legacy mode**:
+     - ground truth = `splicing.layers['junc_ratio_masked_original']`
+     - eval mask = `splicing.layers['junc_ratio_masked_bin_mask']`
+4. Extract `(ground_truth, prediction)` pairs only at nonzero entries of the final
+   mask and compute metrics.
+
+Reported metrics per masked file:
+- `pearson`, `spearman`
+- `l1_mean`, `l1_median`, `l1_p90`
+- `pred_min`, `pred_max`
+- `smape`, `cosine_sim`, `minmax_ratio`, `rmse`
+- `n_eval_entries` and run settings (`impute_batch_size`,
+  `impute_filter_boundary_psi`, `min_atse_count`)
+
+Artifacts:
+- Console logs under each eval run directory
+- `figures/imputation_metrics.csv` (one row per masked file, including zero-entry
+  cases as NaN metrics)
+
 One-command helper:
 
 ```bash

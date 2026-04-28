@@ -337,6 +337,7 @@ AGE_R2_RECORDS = []
 CROSS_FOLD_RECORDS = []
 CROSS_FOLD_SIGNIFICANCE = []
 CROSS_FOLD_CLASS_RECORDS = []
+IMPUTE_RECORDS = []
 MIN_GROUP_N = 25  # minimum cells per tissue | celltype group
 
 
@@ -366,6 +367,16 @@ def _safe_silhouette_score(
         return None
 
     return float(silhouette_score(Z, labels))
+
+
+def _require_layers(adata, required_layers: List[str], context: str):
+    missing = [k for k in required_layers if k not in adata.layers]
+    if missing:
+        available = sorted(list(adata.layers.keys()))
+        raise ValueError(
+            f"[{context}] Missing required splicing layer(s): {missing}. "
+            f"Available layers: {available}"
+        )
 
 
 def evaluate_split(
@@ -2297,6 +2308,17 @@ def main():
                 model.module.eval()
 
                 if args.masked_test_mdata_is_resampled:
+                    _require_layers(
+                        ad_masked,
+                        ["junc_ratio_original"],
+                        context=f"EVAL/IMPUTE/{tag}",
+                    )
+                    if args.min_atse_count != -1:
+                        _require_layers(
+                            ad_masked,
+                            ["cell_by_cluster_matrix_original"],
+                            context=f"EVAL/IMPUTE/{tag}",
+                        )
                     # ── Resampled mode ────────────────────────────────────────
                     # Ground truth = junc_ratio_original (pre-resampling values)
                     # Evaluate only where junc_ratio_original > 0
@@ -2365,6 +2387,11 @@ def main():
                     )
                 else:
                     # ── Legacy masked mode ────────────────────────────────────
+                    _require_layers(
+                        ad_masked,
+                        ["junc_ratio_masked_original", "junc_ratio_masked_bin_mask"],
+                        context=f"EVAL/IMPUTE/{tag}",
+                    )
                     masked_orig = ad_masked.layers["junc_ratio_masked_original"]
                     if not sparse.isspmatrix_csr(masked_orig):
                         masked_orig = sparse.csr_matrix(masked_orig)
@@ -2390,6 +2417,28 @@ def main():
                 if pairs_total == 0:
                     print(
                         f"[EVAL/IMPUTE/{tag}] No eval entries found; skipping correlation."
+                    )
+                    IMPUTE_RECORDS.append(
+                        {
+                            "tag": tag,
+                            "mode": "resampled" if args.masked_test_mdata_is_resampled else "legacy",
+                            "masked_file": masked_path,
+                            "n_eval_entries": 0,
+                            "pearson": np.nan,
+                            "spearman": np.nan,
+                            "l1_mean": np.nan,
+                            "l1_median": np.nan,
+                            "l1_p90": np.nan,
+                            "pred_min": np.nan,
+                            "pred_max": np.nan,
+                            "smape": np.nan,
+                            "cosine_sim": np.nan,
+                            "minmax_ratio": np.nan,
+                            "rmse": np.nan,
+                            "impute_batch_size": bs,
+                            "impute_filter_boundary_psi": bool(args.impute_filter_boundary_psi),
+                            "min_atse_count": int(args.min_atse_count),
+                        }
                     )
                 else:
                     # Extract values at eval positions without densifying
@@ -2450,6 +2499,28 @@ def main():
                         f"cosine: {cosine_sim:.4f}, minmax_ratio: {minmax_ratio:.4f}, "
                         f"RMSE: {rmse:.4e}"
                     )
+                    IMPUTE_RECORDS.append(
+                        {
+                            "tag": tag,
+                            "mode": "resampled" if args.masked_test_mdata_is_resampled else "legacy",
+                            "masked_file": masked_path,
+                            "n_eval_entries": int(pairs_total),
+                            "pearson": pearson_m,
+                            "spearman": spearman_m,
+                            "l1_mean": l1_mean,
+                            "l1_median": l1_median,
+                            "l1_p90": l1_p90,
+                            "pred_min": pred_min,
+                            "pred_max": pred_max,
+                            "smape": smape,
+                            "cosine_sim": cosine_sim,
+                            "minmax_ratio": minmax_ratio,
+                            "rmse": rmse,
+                            "impute_batch_size": bs,
+                            "impute_filter_boundary_psi": bool(args.impute_filter_boundary_psi),
+                            "min_atse_count": int(args.min_atse_count),
+                        }
+                    )
 
                     if run is not None:
                         wandb.log(
@@ -2486,6 +2557,15 @@ def main():
                 except NameError: pass
                 gc.collect()
                 torch.cuda.empty_cache()
+            if len(IMPUTE_RECORDS) > 0:
+                impute_csv = os.path.join(args.fig_dir, "imputation_metrics.csv")
+                pd.DataFrame(IMPUTE_RECORDS).to_csv(impute_csv, index=False)
+                print(
+                    f"[EVAL/IMPUTE] Wrote imputation metrics to {impute_csv} "
+                    f"({len(IMPUTE_RECORDS)} rows)."
+                )
+                if run is not None:
+                    wandb.log({"impute-test/metrics_csv_path": impute_csv})
     else:
         print("[EVAL/IMPUTE] Masked imputation eval skipped by config.")
 
