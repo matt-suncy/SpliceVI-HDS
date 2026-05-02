@@ -2,6 +2,8 @@
 
 Multimodal VAE for joint modeling of alternative splicing (PSI) and gene expression from single-cell data. Built as a fork of [SpliceVI](https://github.com/daklab/SpliceVI).
 
+This fork extends the original SpliceVI model with various alternative latent mixing strategies — including cross-attention, gating, and MLP-based mixers — for combining the expression and splicing posterior distributions into a shared latent space. The primary goal is to compare these mixing strategies on mouse neuronal single-cell data and evaluate their effect on representation quality and cell-type classification.
+
 ---
 
 ## Installation
