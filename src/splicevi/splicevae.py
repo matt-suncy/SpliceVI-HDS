@@ -58,15 +58,19 @@ class CrossAttentionMixer(nn.Module):
     reverse=False (default): AS queries GE — Attention(Q=z_as, K=z_ge, V=z_ge)
     reverse=True:            GE queries AS — Attention(Q=z_ge, K=z_as, V=z_as)
 
-    Two independent attention heads are used: self.attn for the mean, self.attn_v for
-    the log-variance. This mirrors MLPMixer's separate net/net_v design and allows the
-    model to learn different attention patterns for location vs. uncertainty.
+    shared_var_attn=False (default): a separate self.attn_v head is used for log-variance
+        mixing, with Q/K/V all in log-variance space. This lets the model learn independent
+        attention patterns for location vs. uncertainty.
+    shared_var_attn=True: self.attn (mean head) is reused for variance; Q/K come from
+        means and V from log-variance, so the attention routing is tied to the mean pattern.
     """
-    def __init__(self, n_latent, reverse: bool = False):
+    def __init__(self, n_latent, reverse: bool = False, shared_var_attn: bool = True):
         super().__init__()
         # embed_dim=1: each token is a scalar (one latent dimension)
         self.attn   = nn.MultiheadAttention(embed_dim=1, num_heads=1, batch_first=True)
-        self.attn_v = nn.MultiheadAttention(embed_dim=1, num_heads=1, batch_first=True)
+        self.shared_var_attn = shared_var_attn
+        if not shared_var_attn:
+            self.attn_v = nn.MultiheadAttention(embed_dim=1, num_heads=1, batch_first=True)
         self.reverse = reverse
 
     def forward(self, z_as, z_ge):
@@ -83,19 +87,32 @@ class CrossAttentionMixer(nn.Module):
         return out.squeeze(-1)       # (B, Z)
 
     def mix_params(self, mu_as, mu_ge, v_as, v_ge):
-        """Parameter-space mixing: separate attention heads for mean and log-variance."""
+        """Parameter-space mixing for mean and log-variance."""
         mu_out = self.forward(mu_as, mu_ge)  # uses self.attn
-        lv_as = v_as.log()
-        lv_ge = v_ge.log()
-        if self.reverse:  # GE queries AS
-            Q = lv_ge.unsqueeze(-1)
-            K = lv_as.unsqueeze(-1)
-            V = lv_as.unsqueeze(-1)
-        else:             # AS queries GE
-            Q = lv_as.unsqueeze(-1)
-            K = lv_ge.unsqueeze(-1)
-            V = lv_ge.unsqueeze(-1)
-        log_v_out, _ = self.attn_v(Q, K, V)  # independent head for variance
+        if self.shared_var_attn:
+            # Reuse mean head: attention weights from Q/K of means, V from log-variance.
+            if self.reverse:
+                Q = mu_ge.unsqueeze(-1)
+                K = mu_as.unsqueeze(-1)
+                V = v_as.log().unsqueeze(-1)
+            else:
+                Q = mu_as.unsqueeze(-1)
+                K = mu_ge.unsqueeze(-1)
+                V = v_ge.log().unsqueeze(-1)
+            log_v_out, _ = self.attn(Q, K, V)
+        else:
+            # Independent head: Q/K/V all in log-variance space.
+            lv_as = v_as.log()
+            lv_ge = v_ge.log()
+            if self.reverse:
+                Q = lv_ge.unsqueeze(-1)
+                K = lv_as.unsqueeze(-1)
+                V = lv_as.unsqueeze(-1)
+            else:
+                Q = lv_as.unsqueeze(-1)
+                K = lv_ge.unsqueeze(-1)
+                V = lv_ge.unsqueeze(-1)
+            log_v_out, _ = self.attn_v(Q, K, V)
         v_out = log_v_out.squeeze(-1).exp().clamp(min=1e-6)
         return mu_out, v_out
 
