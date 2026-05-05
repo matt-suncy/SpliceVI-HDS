@@ -18,8 +18,9 @@ conda activate splicevi-env
 ### 2. Install the package
 
 ```bash
-git clone https://github.com/daklab/SpliceVI.git
-cd SpliceVI
+git clone https://github.com/matt-suncy/SpliceVI-HDS.git
+git switch submission
+cd SpliceVI-HDS
 pip install -e .
 ```
 
