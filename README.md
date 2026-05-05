@@ -1,4 +1,4 @@
-# Analysis and Evaluation of SpliceVI Joint Embeddings on Mouse Neuronal Data
+# Joint Embedding of Alternative Splicing and Gene Expression Using Partial VAEs with Mouse Neuronal Data
 
 Multimodal VAE for joint modeling of alternative splicing (PSI) and gene expression from single-cell data. Built as a fork of [SpliceVI](https://github.com/daklab/SpliceVI).
 
