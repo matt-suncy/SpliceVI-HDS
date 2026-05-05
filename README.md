@@ -139,12 +139,6 @@ python scripts/build_splicevi_mudata.py \
   --output-h5mu data/processed/splicevi_custom_input.h5mu
 ```
 
-For a quick smoke test on a subset, add:
-
-```bash
-  --max-cells 512 --max-expr-features 5000 --max-splicing-features 5000
-```
-
 2. Validate that the generated `.h5mu` has all required fields/layers:
 
 ```bash
@@ -176,59 +170,6 @@ python train_splicevi.py \
   --batch_key seq_batch
 ```
 
-5. (Optional, for imputation eval) Generate masked TEST artifacts:
-
-```bash
-python scripts/multinomial_resampling_masking.py \
-  --input-test-h5mu data/processed/splicevi_custom_input_test30.h5mu \
-  --output-dir data/processed/masked_impute \
-  --mask-fracs 0.25 0.50 \
-  --mode resampled
-```
-
-This writes files like:
-- `RESAMPLED_25_PERCENT_<test_stem>.h5mu`
-- `RESAMPLED_50_PERCENT_<test_stem>.h5mu`
-
-Use `--mode legacy` (or `--mode both`) if you need the legacy masked layers
-(`junc_ratio_masked_original`, `junc_ratio_masked_bin_mask`).
-
-### How masked imputation evaluation is computed
-
-`eval_splicevi.py` evaluates imputation only when `masked_impute` is in `--evals`
-and masked files are passed via `--masked_test_mdata_paths`.
-
-For each masked file:
-
-1. Load masked MuData and enforce feature compatibility with training features.
-2. Run model inference with `get_normalized_splicing(...)` to predict PSI for all
-   cell-junction pairs.
-3. Build the evaluation mask:
-   - **Resampled mode** (`--masked_test_mdata_is_resampled`):
-     - ground truth = `splicing.layers['junc_ratio_original']`
-     - include entries where PSI `> 0`
-     - if `--impute_filter_boundary_psi` is set, further require PSI `< 1`
-     - if `--min_atse_count != -1`, further require
-       `splicing.layers['cell_by_cluster_matrix_original'] >= min_atse_count`
-   - **Legacy mode**:
-     - ground truth = `splicing.layers['junc_ratio_masked_original']`
-     - eval mask = `splicing.layers['junc_ratio_masked_bin_mask']`
-4. Extract `(ground_truth, prediction)` pairs only at nonzero entries of the final
-   mask and compute metrics.
-
-Reported metrics per masked file:
-- `pearson`, `spearman`
-- `l1_mean`, `l1_median`, `l1_p90`
-- `pred_min`, `pred_max`
-- `smape`, `cosine_sim`, `minmax_ratio`, `rmse`
-- `n_eval_entries` and run settings (`impute_batch_size`,
-  `impute_filter_boundary_psi`, `min_atse_count`)
-
-Artifacts:
-- Console logs under each eval run directory
-- `figures/imputation_metrics.csv` (one row per masked file, including zero-entry
-  cases as NaN metrics)
-
 One-command helper:
 
 ```bash
@@ -239,20 +180,18 @@ Detailed split behavior and reproducibility checklist:
 
 - See [docs/DATA_SPLITTING.md](docs/DATA_SPLITTING.md)
 
-## Retrained Model Evaluation (Smoke -> Full)
+## Custom Retrained Model Evaluation (Smoke -> Full)
 
 Use the staged evaluator to run a fast compatibility check first, then a full evaluation sweep with the same model and data wiring.
 
-Smoke run (recommended first):
+Smoke run (optional but recommended):
 
 ```bash
 bash scripts/run_staged_eval.sh \
   --mode smoke \
   --model-dir models/custom_baseline_run \
-  --train-h5mu data/processed/train_splicevi_input.h5mu \
-  --test-h5mu data/processed/test_splicevi_input.h5mu \
-  --masked-h5mu data/processed/masked_impute/RESAMPLED_25_PERCENT_test_splicevi_input.h5mu \
-  --masked-resampled
+  --train-h5mu data/processed/splicevi_custom_input_train70.h5mu \
+  --test-h5mu data/processed/splicevi_custom_input_test30.h5mu \
 ```
 
 Full run (after smoke passes):
@@ -261,19 +200,9 @@ Full run (after smoke passes):
 bash scripts/run_staged_eval.sh \
   --mode full \
   --model-dir models/custom_baseline_run \
-  --train-h5mu data/processed/train_splicevi_input.h5mu \
-  --test-h5mu data/processed/test_splicevi_input.h5mu \
-  --masked-h5mu data/processed/masked_impute/RESAMPLED_25_PERCENT_test_splicevi_input.h5mu \
-  --masked-h5mu data/processed/masked_impute/RESAMPLED_50_PERCENT_test_splicevi_input.h5mu \
-  --masked-resampled
+  --train-h5mu data/processed/splicevi_custom_input_train70.h5mu \
+  --test-h5mu data/processed/splicevi_custom_input_test30.h5mu
 ```
-
-What this runner does:
-
-- Validates both train/test `.h5mu` files with `scripts/validate_splicevi_mudata.py` before evaluation.
-- In `smoke` mode, runs `masked_impute` if masked files are provided; otherwise falls back to `test_eval`.
-- In `full` mode, runs `umap`, `clustering`, `train_eval`, `test_eval`, `cross_fold_classification`, `age_r2_heatmap`, and optionally `masked_impute`.
-- Writes run artifacts to `logs/eval_runs/eval_<mode>_<model>_<timestamp>/` including `eval.log` and `launch_command.sh` for reproducibility.
 
 ### Required Output Schema for `train_splicevi.py`
 
@@ -292,38 +221,6 @@ The builder writes a `.h5mu` with:
 - `obs['donor_id']`
 - `obs['age_days']` (numeric; mirrored to `age_numeric` for compatibility)
 
-### Notes on Splicing Layer Construction
-
-The builder derives required splicing layers directly from the event IDs in
-`MO_VIS_core.individual.cass.mat.txt`:
-
-- Each event row is first expanded into two intermediate junction rows:
-  - upstream junction `(upstream_end, cassette_start)`
-  - downstream junction `(cassette_end, downstream_start)`
-- Intermediate rows are then collapsed to unique genomic junction features using
-  key `(event_type, gene_id, junction_side, junction_start, junction_end)`.
-  This removes duplicate per-row junction artifacts while preserving gene-aware
-  coordinates and junction-side identity.
-- Junction counts are inferred from event support fields in `[inc/exc]` and PSI:
-  - upstream count per cell: `round(PSI * inc_support)`
-  - downstream count per cell: `round(PSI * exc_support)`
-- For collapsed junctions, counts and support are aggregated across contributing
-  intermediate rows; `junc_ratio` is recomputed as
-  `aggregated_counts / aggregated_support` and clipped to `[0, 1]`.
-- ATSE counts are computed by summing junction counts within grouping key
-  `splicing.var['event_id']`, controlled by `--atse-grouping-mode`:
-  - `both_anchors` (default)
-  - `upstream_only`
-  - `downstream_only`
-- Binary mask is derived from ATSE counts (not PSI missingness):
-  - `psi_mask = 1` when `ATSE_count > --mask-atse-threshold`
-  - `psi_mask = 0` otherwise
-
-This is now the default and only supported count/mask construction mode.
-
-Future additions:
-- [ ] Add `tutorial.ipynb` for a walkthrough of model setup, training, and application to other datasets.
-- [ ] Add trained models to Hugging Face
 ---
 
 ## References
