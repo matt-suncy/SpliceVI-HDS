@@ -48,7 +48,7 @@ SpliceVI/
 │   ├── validate_splicevi_mudata.py     # Check required layers/fields are present
 │   ├── create_test_split.py            # Stratified 70/30 train/test split
 │   ├── multinomial_resampling_masking.py  # Generate masked test files for imputation eval
-│   └── run_staged_eval.sh              # Smoke → full evaluation runner
+│   └── run_staged_eval.sh              # Evaluation runner (from smoke test to full eval)
 ├── pyproject.toml           # Package configuration and dependencies
 └── requirements.txt         # Full conda environment freeze (reference only)
 ```
@@ -81,9 +81,7 @@ full details on each mixer's implementation, parameters, and warmup behaviour.
 
 ---
 
-## Usage
-
-### Training
+## Training
 
 **Single mixer variant** — edit hyperparameters in `slurm_train_splicevi.sh`, then pass
 the desired `modality_weights` value as the first argument:
@@ -114,15 +112,7 @@ python train_splicevi.py \
 python train_splicevi.py --help
 ```
 
-### Evaluation
-
-```bash
-sbatch eval_splicevi.sh
-# or directly:
-python eval_splicevi.py --help
-```
-
-## Custom Data Workflow (Tables -> .h5mu -> Train)
+## Custom Data Preprocessing Workflow
 
 If your data starts as separate expression/splicing/metadata tables in `data/`, use:
 
@@ -179,9 +169,9 @@ bash scripts/run_custom_pipeline.sh
 
 Detailed split behavior and reproducibility checklist:
 
-- See [docs/DATA_SPLITTING.md](docs/DATA_SPLITTING.md)
+- See [docs/data_splitting.md](docs/data_splitting.md)
 
-## Custom Retrained Model Evaluation (Smoke -> Full)
+## Evaluation
 
 Use the staged evaluator to run a fast compatibility check first, then a full evaluation sweep with the same model and data wiring.
 
