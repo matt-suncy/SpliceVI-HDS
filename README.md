@@ -69,8 +69,6 @@ full details on each mixer's implementation, parameters, and warmup behaviour.
 | `modality_weights` | Class | Learnable | Description |
 |---|---|---|---|
 | `equal` | *(built-in)* | No | Weighted average with uniform weights |
-| `universal` | *(built-in)* | Yes | Single scalar weight shared across all cells |
-| `cell` | *(built-in)* | Yes | Per-cell weight vector `(n_obs, 2)` |
 | `concatenate` | *(built-in)* | No | Concatenates both latents; doubles the effective latent dimension |
 | `sum` | `SumMixer` | No | Elementwise sum of both latent vectors |
 | `product` | `ProductMixer` | No | Elementwise product of both latent vectors |
