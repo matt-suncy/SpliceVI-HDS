@@ -5,9 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
-#SBATCH --exclude=ins082,ins093,ins092,ins084,ins090,ins085
 #SBATCH --time=03:00:00
-#SBATCH -A pmg 
 
 
 set -euo pipefail
