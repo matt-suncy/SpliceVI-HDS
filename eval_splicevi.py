@@ -1226,7 +1226,6 @@ def build_argparser():
             "train_eval",
             "test_eval",
             "age_r2_heatmap",
-            "masked_impute",
         ],
         help=(
             "Which eval blocks to run. Choices among: "
