@@ -365,7 +365,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         n_junctions: int | None = None,
 
         # --- Modality mixing ---
-        modality_weights: Literal["equal", "cell", "universal", "concatenate"] = "equal",
+        modality_weights: Literal["equal", "cell", "universal", "concatenate", "sum", "product", "gating", "cross_attention", "cross_attention_reverse", "mlp"] = "equal",
         modality_penalty: Literal["Jeffreys", "MMD", "None"] = "Jeffreys",
 
         # --- Shared SCVI-style encoder/decoder hyperparameters ---
@@ -1662,7 +1662,12 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         mudata_fields = [
             batch_field,
             fields.MuDataCategoricalObsField(REGISTRY_KEYS.LABELS_KEY, None, mod_key=None),
-            fields.MuDataObsmField(REGISTRY_KEYS.SIZE_FACTOR_KEY, attr_key=size_factor_key,is_count_data=False),
+            fields.MuDataObsmField(
+                REGISTRY_KEYS.SIZE_FACTOR_KEY,
+                attr_key=size_factor_key,
+                mod_key=modalities.rna_layer,
+                is_count_data=False,
+            ),
             fields.MuDataCategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys, mod_key=modalities.categorical_covariate_keys),
             fields.MuDataNumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys, mod_key=modalities.continuous_covariate_keys),
             fields.MuDataNumericalObsField(REGISTRY_KEYS.INDICES_KEY, "_indices", mod_key=modalities.idx_layer, required=False),

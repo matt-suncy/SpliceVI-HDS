@@ -35,7 +35,7 @@ import matplotlib.cm as cm
 import seaborn as sns
 
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import make_pipeline
@@ -44,6 +44,9 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
     silhouette_score,
     adjusted_mutual_info_score,
 )
@@ -185,6 +188,148 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
         )
 
 
+def _align_modality_features_or_fail(
+    adata,
+    target_var_names: pd.Index,
+    modality_name: str,
+    split_name: str,
+    train_path: str,
+    source_path: str,
+):
+    """Ensure modality features are compatible with model training features.
+
+    If sets match but order differs, reorder to target_var_names.
+    If sets differ, raise an actionable error for rebuilding test/masked data.
+    """
+    current = pd.Index(adata.var_names.astype(str))
+    target = pd.Index(target_var_names.astype(str))
+
+    if current.equals(target):
+        return adata
+
+    same_set = (
+        len(current) == len(target)
+        and current.is_unique
+        and target.is_unique
+        and current.difference(target).empty
+        and target.difference(current).empty
+    )
+    if same_set:
+        print(
+            f"[DATA/{split_name}] Reordering {modality_name} features to match TRAIN model registry."
+        )
+        return adata[:, target].copy()
+
+    missing = target.difference(current)
+    extra = current.difference(target)
+    missing_preview = missing[:5].tolist()
+    extra_preview = extra[:5].tolist()
+
+    raise ValueError(
+        f"[DATA/{split_name}] Incompatible {modality_name} feature schema for model transfer. "
+        f"TRAIN has {len(target)} features, input has {len(current)} features. "
+        f"Missing-from-input={len(missing)} (example: {missing_preview}); "
+        f"extra-in-input={len(extra)} (example: {extra_preview}). "
+        "This usually means TRAIN and TEST/MASKED files were built with different data-prep logic. "
+        f"TRAIN file: {train_path}; input file: {source_path}. "
+        "Rebuild evaluation inputs from the same TRAIN source, e.g.: "
+        f"python scripts/create_test_split.py --train-path {train_path} "
+        "--output-path data/processed/splicevi_test_compatible.h5mu --test-frac 0.1"
+    )
+
+
+def _ensure_feature_compatibility_or_fail(
+    mdata,
+    target_rna_var_names: pd.Index,
+    target_splicing_var_names: pd.Index,
+    split_name: str,
+    train_path: str,
+    source_path: str,
+):
+    """Align feature order or fail fast when feature sets are incompatible."""
+    aligned_rna = _align_modality_features_or_fail(
+        mdata["rna"],
+        target_rna_var_names,
+        modality_name="RNA",
+        split_name=split_name,
+        train_path=train_path,
+        source_path=source_path,
+    )
+    aligned_splicing = _align_modality_features_or_fail(
+        mdata["splicing"],
+        target_splicing_var_names,
+        modality_name="splicing",
+        split_name=split_name,
+        train_path=train_path,
+        source_path=source_path,
+    )
+
+    if aligned_rna is mdata["rna"] and aligned_splicing is mdata["splicing"]:
+        return mdata
+
+    print(
+        f"[DATA/{split_name}] Rebuilding MuData container after feature alignment."
+    )
+    m_aligned = mu.MuData({"rna": aligned_rna, "splicing": aligned_splicing})
+    m_aligned.obs = mdata.obs.copy()
+    return m_aligned
+
+
+def _ensure_batch_key_available(mdata, batch_key: Optional[str], split_name: str):
+    """Resolve batch_key from any obs scope and propagate it to all expected obs tables."""
+    if batch_key is None:
+        return None
+
+    source_scope = None
+    source_series = None
+
+    if batch_key in mdata.obs.columns:
+        source_scope = "mdata.obs"
+        source_series = mdata.obs[batch_key]
+    elif "rna" in mdata.mod and batch_key in mdata["rna"].obs.columns:
+        source_scope = "rna.obs"
+        source_series = mdata["rna"].obs[batch_key]
+    elif "splicing" in mdata.mod and batch_key in mdata["splicing"].obs.columns:
+        source_scope = "splicing.obs"
+        source_series = mdata["splicing"].obs[batch_key]
+
+    if source_series is None:
+        global_cols = list(mdata.obs.columns)
+        rna_cols = list(mdata["rna"].obs.columns) if "rna" in mdata.mod else []
+        splicing_cols = list(mdata["splicing"].obs.columns) if "splicing" in mdata.mod else []
+        raise ValueError(
+            f"[MODEL/{split_name}] batch_key '{batch_key}' not found in any obs scope. "
+            f"mdata.obs sample={global_cols[:20]}; "
+            f"rna.obs sample={rna_cols[:20]}; "
+            f"splicing.obs sample={splicing_cols[:20]}"
+        )
+
+    print(
+        f"[MODEL/{split_name}] Using batch_key '{batch_key}' from {source_scope}; "
+        "propagating to all obs scopes."
+    )
+
+    def _propagate_one(obs_df, scope_name):
+        aligned = source_series.reindex(obs_df.index)
+        obs_df[batch_key] = aligned.values
+        n_missing = int(aligned.isna().sum())
+        if n_missing > 0:
+            print(
+                f"[MODEL/{split_name}] WARNING: {n_missing} missing values for "
+                f"'{batch_key}' after propagation to {scope_name}."
+            )
+
+    _propagate_one(mdata.obs, "mdata.obs")
+    if "rna" in mdata.mod:
+        _propagate_one(mdata["rna"].obs, "rna.obs")
+    if "splicing" in mdata.mod:
+        _propagate_one(mdata["splicing"].obs, "splicing.obs")
+
+    n_batch_categories = int(mdata.obs[batch_key].astype("string").nunique(dropna=False))
+    print(f"[MODEL/{split_name}] batch_key '{batch_key}' categories: {n_batch_categories}")
+    return n_batch_categories
+
+
 # ---------------------------------------------------------------------
 # Evaluation helper: train/test split metrics
 # ---------------------------------------------------------------------
@@ -192,7 +337,46 @@ AGE_R2_RECORDS = []
 CROSS_FOLD_RECORDS = []
 CROSS_FOLD_SIGNIFICANCE = []
 CROSS_FOLD_CLASS_RECORDS = []
+IMPUTE_RECORDS = []
 MIN_GROUP_N = 25  # minimum cells per tissue | celltype group
+
+
+def _safe_silhouette_score(
+    Z: np.ndarray,
+    labels: np.ndarray,
+    label_name: str,
+    split_name: str,
+    latent_name: str,
+) -> Optional[float]:
+    """Return silhouette score only when sklearn validity constraints are met."""
+    n_samples = int(len(labels))
+    n_unique = int(pd.Series(labels).nunique(dropna=False))
+
+    if n_samples < 3:
+        print(
+            f"[EVAL/{split_name}-{latent_name}] Skipping silhouette ({label_name}): "
+            f"need >=3 samples, got {n_samples}."
+        )
+        return None
+
+    if n_unique < 2 or n_unique >= n_samples:
+        print(
+            f"[EVAL/{split_name}-{latent_name}] Skipping silhouette ({label_name}): "
+            f"need 2..n-1 unique labels, got {n_unique} for n={n_samples}."
+        )
+        return None
+
+    return float(silhouette_score(Z, labels))
+
+
+def _require_layers(adata, required_layers: List[str], context: str):
+    missing = [k for k in required_layers if k not in adata.layers]
+    if missing:
+        available = sorted(list(adata.layers.keys()))
+        raise ValueError(
+            f"[{context}] Missing required splicing layer(s): {missing}. "
+            f"Available layers: {available}"
+        )
 
 
 def evaluate_split(
@@ -201,6 +385,7 @@ def evaluate_split(
     model,
     umap_color_key: str,
     cell_type_classification_key: str,
+    age_target_col: str,
     Z_type: str = "joint",
     wandb=None,
     precomputed_Z: Optional[np.ndarray] = None,
@@ -236,25 +421,51 @@ def evaluate_split(
             }
         )
 
-    # Silhouette scores
+    # Silhouette scores (resolve keys on this split and guard invalid label cardinality)
     print(f"[EVAL/{name}-{Z_type}] Computing silhouette scores...")
-    labels_broad = mdata.obs[umap_color_key].astype(str).values
-    sil_broad = silhouette_score(Z, labels_broad)
-    labels_med = mdata.obs[cell_type_classification_key].astype(str).values
-    sil_med = silhouette_score(Z, labels_med)
+    obs_cols = [c for c in mdata.obs.columns if not str(c).startswith("_")]
+    fallback_key = obs_cols[0] if obs_cols else None
 
-    print(f"[EVAL/{name}-{Z_type}] Silhouette ({umap_color_key}): {sil_broad:.4f}")
-    print(
-        f"[EVAL/{name}-{Z_type}] Silhouette ({cell_type_classification_key}): {sil_med:.4f}"
+    broad_key = umap_color_key if umap_color_key in mdata.obs.columns else fallback_key
+    med_key = (
+        cell_type_classification_key
+        if cell_type_classification_key in mdata.obs.columns
+        else broad_key
     )
 
-    if wandb is not None:
-        wandb.log(
-            {
-                f"real-{name}-{Z_type}/{umap_color_key}-silhouette_score": sil_broad,
-                f"real-{name}-{Z_type}/{cell_type_classification_key}-silhouette_score": sil_med,
-            }
+    if broad_key is None:
+        print(
+            f"[EVAL/{name}-{Z_type}] No usable obs columns found; skipping silhouette and LR classification."
         )
+        return
+
+    if broad_key != umap_color_key:
+        print(
+            f"[EVAL/{name}-{Z_type}] '{umap_color_key}' missing; using '{broad_key}' instead."
+        )
+    if med_key != cell_type_classification_key:
+        print(
+            f"[EVAL/{name}-{Z_type}] '{cell_type_classification_key}' missing; using '{med_key}' instead."
+        )
+
+    labels_broad = mdata.obs[broad_key].astype(str).values
+    sil_broad = _safe_silhouette_score(Z, labels_broad, broad_key, name, Z_type)
+    labels_med = mdata.obs[med_key].astype(str).values
+    sil_med = _safe_silhouette_score(Z, labels_med, med_key, name, Z_type)
+
+    if sil_broad is not None:
+        print(f"[EVAL/{name}-{Z_type}] Silhouette ({broad_key}): {sil_broad:.4f}")
+    if sil_med is not None:
+        print(f"[EVAL/{name}-{Z_type}] Silhouette ({med_key}): {sil_med:.4f}")
+
+    if wandb is not None:
+        metrics = {}
+        if sil_broad is not None:
+            metrics[f"real-{name}-{Z_type}/{broad_key}-silhouette_score"] = sil_broad
+        if sil_med is not None:
+            metrics[f"real-{name}-{Z_type}/{med_key}-silhouette_score"] = sil_med
+        if metrics:
+            wandb.log(metrics)
 
     # LR classification on medium cell type
     print(f"[EVAL/{name}-{Z_type}] Training logistic regression classifier...")
@@ -285,21 +496,26 @@ def evaluate_split(
         )
 
     # Age regression tasks
-    if "age_numeric" in mdata.obs:
-        print(f"[EVAL/{name}-{Z_type}] Running age R² regression tasks...")
-        ages_full = mdata.obs["age_numeric"].astype(float).values
-        target_ages = np.array([3.0, 18.0, 24.0], dtype=float)
-        mask_age = np.isin(ages_full, target_ages)
+    age_candidates = []
+    for candidate in [age_target_col, "age_days", "age_numeric"]:
+        if candidate and candidate not in age_candidates:
+            age_candidates.append(candidate)
+    age_col = next((c for c in age_candidates if c in mdata.obs.columns), None)
+
+    if age_col is not None:
+        print(f"[EVAL/{name}-{Z_type}] Running ridge regression for '{age_col}'...")
+        age_series = pd.to_numeric(mdata.obs[age_col], errors="coerce")
+        mask_age = age_series.notna().to_numpy()
         n_kept = int(mask_age.sum())
-        print(f"[EVAL/{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells at ages {target_ages.tolist()}")
+        print(f"[EVAL/{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells with valid '{age_col}'.")
 
         if n_kept < MIN_GROUP_N:
             print(
-                f"[EVAL/{name}-{Z_type}] Only {n_kept} cells with target ages; skipping age R² tasks."
+                f"[EVAL/{name}-{Z_type}] Only {n_kept} cells have valid '{age_col}'; skipping age regression."
             )
             return
 
-        ages = ages_full[mask_age]
+        ages = age_series.to_numpy(dtype=float)[mask_age]
         Z_use = Z[mask_age, :]
         obs_local = mdata.obs.iloc[np.where(mask_age)[0]].copy()
 
@@ -308,33 +524,56 @@ def evaluate_split(
             X_latent, ages, test_size=0.2, random_state=0
         )
 
-        # Global R²
+        # Global ridge regression metrics
         if np.std(y_tr) == 0.0 or np.std(y_ev) == 0.0:
             print(
-                f"[EVAL/{name}-{Z_type}] Degenerate age variance after filtering; skipping global age R²."
+                f"[EVAL/{name}-{Z_type}] Degenerate '{age_col}' variance; skipping global regression metrics."
             )
         else:
             ridge = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(X_tr, y_tr)
-            r2_age = ridge.score(X_ev, y_ev)
-            print(f"[EVAL/{name}-{Z_type}] Global age R²: {r2_age:.4f}")
+            y_pred = ridge.predict(X_ev)
+            r2_age = float(ridge.score(X_ev, y_ev))
+            mae_age = float(mean_absolute_error(y_ev, y_pred))
+            rmse_age = float(np.sqrt(mean_squared_error(y_ev, y_pred)))
+
+            print(
+                f"[EVAL/{name}-{Z_type}] Global {age_col} metrics: "
+                f"R²={r2_age:.4f}, MAE={mae_age:.4f}, RMSE={rmse_age:.4f}"
+            )
+            AGE_R2_RECORDS.append(
+                {
+                    "dataset": name,
+                    "space": Z_type,
+                    "age_target_col": age_col,
+                    "pair": "__global__",
+                    "tissue": "all",
+                    "cell_type": "all",
+                    "r2": r2_age,
+                    "mae": mae_age,
+                    "rmse": rmse_age,
+                    "n": int(n_kept),
+                }
+            )
             if wandb is not None:
                 wandb.log(
                     {
-                        f"real-{name}-{Z_type}/age_r2": r2_age,
-                        f"real-{name}-{Z_type}/age_n_cells": n_kept,
+                        f"real-{name}-{Z_type}/{age_col}_r2": r2_age,
+                        f"real-{name}-{Z_type}/{age_col}_mae": mae_age,
+                        f"real-{name}-{Z_type}/{age_col}_rmse": rmse_age,
+                        f"real-{name}-{Z_type}/{age_col}_n_cells": n_kept,
                     }
                 )
 
-        # Per (tissue | cell_type) R²
-        if "tissue" in obs_local:
-            ct_key = cell_type_classification_key
+        # Per (tissue | cell_type) regression metrics
+        if "tissue" in obs_local and cell_type_classification_key in obs_local:
             tissue_series = obs_local["tissue"].astype(str)
-            ct_series = obs_local[ct_key].astype(str)
+            ct_series = obs_local[cell_type_classification_key].astype(str)
             pair = tissue_series + " | " + ct_series
             pair_unique = pair.unique()
 
             print(
-                f"[EVAL/{name}-{Z_type}] Computing per-group age R² for {len(pair_unique)} tissue|cell_type pairs..."
+                f"[EVAL/{name}-{Z_type}] Computing per-group {age_col} regression for "
+                f"{len(pair_unique)} tissue|cell_type pairs..."
             )
 
             for p in pair_unique:
@@ -344,7 +583,6 @@ def evaluate_split(
 
                 Zg = X_latent[idx]
                 yg = ages[idx]
-
                 if np.std(yg) == 0.0:
                     continue
 
@@ -359,25 +597,31 @@ def evaluate_split(
                 ):
                     continue
 
-                try:
-                    rg = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(Ztr, ytr)
-                    r2g = rg.score(Zev, yev)
-                except Exception:
-                    continue
+                rg = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(Ztr, ytr)
+                yg_pred = rg.predict(Zev)
+                r2g = float(rg.score(Zev, yev))
+                maeg = float(mean_absolute_error(yev, yg_pred))
+                rmseg = float(np.sqrt(mean_squared_error(yev, yg_pred)))
 
                 AGE_R2_RECORDS.append(
                     {
                         "dataset": name,
                         "space": Z_type,
+                        "age_target_col": age_col,
                         "pair": p,
                         "tissue": p.split(" | ", 1)[0],
                         "cell_type": p.split(" | ", 1)[1],
-                        "r2": float(r2g),
+                        "r2": r2g,
+                        "mae": maeg,
+                        "rmse": rmseg,
                         "n": int(idx.size),
                     }
                 )
     else:
-        print(f"[EVAL/{name}-{Z_type}] No 'age_numeric' column found; skipping age R².")
+        print(
+            f"[EVAL/{name}-{Z_type}] No age target column found in obs "
+            f"(candidates={age_candidates}); skipping age regression."
+        )
 
 
 def run_cross_fold_classification(
@@ -411,25 +655,34 @@ def run_cross_fold_classification(
         print("[CROSS-FOLD] No latent spaces provided; skipping.")
         return
 
-    metric_fns = {}
+    cls_metric_fns = {}
+    reg_metric_fns = {}
     for name in metrics:
         if name == "accuracy":
-            metric_fns[name] = accuracy_score
+            cls_metric_fns[name] = accuracy_score
         elif name == "f1_weighted":
-            metric_fns[name] = lambda yt, yp: f1_score(
+            cls_metric_fns[name] = lambda yt, yp: f1_score(
                 yt, yp, average="weighted", zero_division=0
             )
         elif name == "precision_weighted":
-            metric_fns[name] = lambda yt, yp: precision_score(
+            cls_metric_fns[name] = lambda yt, yp: precision_score(
                 yt, yp, average="weighted", zero_division=0
             )
         elif name == "recall_weighted":
-            metric_fns[name] = lambda yt, yp: recall_score(
+            cls_metric_fns[name] = lambda yt, yp: recall_score(
                 yt, yp, average="weighted", zero_division=0
+            )
+        elif name == "r2":
+            reg_metric_fns[name] = r2_score
+        elif name == "mae":
+            reg_metric_fns[name] = mean_absolute_error
+        elif name == "rmse":
+            reg_metric_fns[name] = lambda yt, yp: float(
+                np.sqrt(mean_squared_error(yt, yp))
             )
         else:
             print(f"[CROSS-FOLD] Unknown metric '{name}' requested; skipping it.")
-    if len(metric_fns) == 0:
+    if len(cls_metric_fns) == 0 and len(reg_metric_fns) == 0:
         print("[CROSS-FOLD] No valid metrics provided; skipping cross-fold.")
         return
 
@@ -456,15 +709,177 @@ def run_cross_fold_classification(
             )
         raise ValueError(f"Unsupported classifier '{name}'.")
 
+    def build_regressor(name: str):
+        if name == "ridge":
+            return make_pipeline(
+                StandardScaler(),
+                RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5),
+            )
+        raise ValueError(f"Unsupported regressor '{name}'.")
+
     for target in targets:
         if target not in mdata.obs.columns:
             print(f"[CROSS-FOLD] Target '{target}' missing in obs; skipping.")
             continue
 
-        labels_series_full = mdata.obs[target].astype("string").fillna("NA")
+        target_series = mdata.obs[target]
+        is_regression_target = target in {"age_days", "age", "age_numeric"}
+        if not is_regression_target:
+            numeric_probe = pd.to_numeric(target_series, errors="coerce")
+            finite_ratio = float(np.isfinite(numeric_probe.to_numpy()).mean())
+            if finite_ratio > 0.95 and int(pd.Series(numeric_probe).nunique(dropna=True)) >= 20:
+                is_regression_target = True
+
+        if is_regression_target:
+            y_all = pd.to_numeric(target_series, errors="coerce").to_numpy(dtype=float)
+            valid_mask = np.isfinite(y_all)
+            total_n_samples = int(y_all.size)
+            if not valid_mask.any():
+                print(f"[CROSS-FOLD] Target '{target}' has no finite values; skipping.")
+                continue
+            keep_indices = np.flatnonzero(valid_mask)
+            y = y_all[keep_indices]
+            n_samples = int(y.size)
+            if n_samples < max(k_folds, 10):
+                print(
+                    f"[CROSS-FOLD] Target '{target}' has too few valid samples for regression CV "
+                    f"(n={n_samples}, k={k_folds}); skipping."
+                )
+                continue
+
+            reg_candidates = [c for c in classifiers if c == "ridge"]
+            if len(reg_candidates) == 0:
+                print(
+                    f"[CROSS-FOLD] Target '{target}' is continuous, but no regression model "
+                    "requested (add 'ridge' to --cross_fold_classifiers); skipping."
+                )
+                continue
+            if len(reg_metric_fns) == 0:
+                print(
+                    f"[CROSS-FOLD] Target '{target}' is continuous but no regression metrics "
+                    "requested (use metrics from: r2, mae, rmse); skipping."
+                )
+                continue
+
+            k_use = min(k_folds, n_samples)
+            if k_use < 2:
+                print(
+                    f"[CROSS-FOLD] Target '{target}' does not have enough samples for k-fold; skipping."
+                )
+                continue
+            splits = list(KFold(n_splits=k_use, shuffle=True, random_state=42).split(y))
+            fold_scores: Dict[Tuple[str, str, str], List[float]] = {}
+
+            print(
+                f"[CROSS-FOLD] Regression target '{target}' | n={n_samples}, folds={k_use}"
+            )
+
+            for space_name in available_spaces:
+                Z_full = latent_spaces[space_name]
+                if Z_full.shape[0] != total_n_samples:
+                    print(
+                        f"[CROSS-FOLD] Latent '{space_name}' has {Z_full.shape[0]} rows but expected {total_n_samples}; skipping this space."
+                    )
+                    continue
+                Z = Z_full[keep_indices]
+
+                for reg_name in reg_candidates:
+                    for tr_idx, ev_idx in splits:
+                        reg_fit = build_regressor(reg_name)
+                        reg_fit.fit(Z[tr_idx], y[tr_idx])
+                        y_pred = reg_fit.predict(Z[ev_idx])
+                        y_true = y[ev_idx]
+                        for metric_name, metric_fn in reg_metric_fns.items():
+                            score = float(metric_fn(y_true, y_pred))
+                            fold_scores.setdefault(
+                                (reg_name, metric_name, space_name), []
+                            ).append(score)
+
+            for (reg_name, metric_name, space_name), scores in fold_scores.items():
+                mean_score = float(np.mean(scores))
+                std_score = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+                CROSS_FOLD_RECORDS.append(
+                    {
+                        "split": split_name,
+                        "target": target,
+                        "target_type": "regression",
+                        "classifier": reg_name,
+                        "space": space_name,
+                        "metric": metric_name,
+                        "mean": mean_score,
+                        "std": std_score,
+                        "n_folds": len(scores),
+                        "n_samples": n_samples,
+                        "n_classes": np.nan,
+                    }
+                )
+                print(
+                    f"[CROSS-FOLD] {split_name} | {target} | {reg_name} | {space_name} | "
+                    f"{metric_name}: {mean_score:.4f} ± {std_score:.4f} (n={len(scores)})"
+                )
+                if wandb is not None:
+                    wandb.log(
+                        {
+                            f"crossfold/{split_name}/{target}/{reg_name}/{space_name}/{metric_name}_mean": mean_score,
+                            f"crossfold/{split_name}/{target}/{reg_name}/{space_name}/{metric_name}_std": std_score,
+                        }
+                    )
+
+            for reg_name in reg_candidates:
+                for metric_name in reg_metric_fns.keys():
+                    for i in range(len(available_spaces)):
+                        for j in range(i + 1, len(available_spaces)):
+                            a = available_spaces[i]
+                            b = available_spaces[j]
+                            key_a = (reg_name, metric_name, a)
+                            key_b = (reg_name, metric_name, b)
+                            if key_a not in fold_scores or key_b not in fold_scores:
+                                continue
+                            scores_a = np.array(fold_scores[key_a], dtype=float)
+                            scores_b = np.array(fold_scores[key_b], dtype=float)
+                            if scores_a.size < 2 or scores_b.size < 2:
+                                pval = np.nan
+                                mean_diff = np.nan
+                            else:
+                                _, pval = ttest_rel(scores_a, scores_b)
+                                mean_diff = float(scores_a.mean() - scores_b.mean())
+                            CROSS_FOLD_SIGNIFICANCE.append(
+                                {
+                                    "split": split_name,
+                                    "target": target,
+                                    "target_type": "regression",
+                                    "classifier": reg_name,
+                                    "metric": metric_name,
+                                    "space_a": a,
+                                    "space_b": b,
+                                    "pvalue": float(pval) if pval is not None else np.nan,
+                                    "mean_diff_a_minus_b": mean_diff,
+                                    "n_folds": int(min(scores_a.size, scores_b.size)),
+                                }
+                            )
+                            print(
+                                f"[CROSS-FOLD] Significance {split_name} | {target} | {reg_name} | {metric_name} : "
+                                f"{a} vs {b} p={pval:.4e} (diff={mean_diff:.4f})"
+                            )
+            continue
+
+        labels_series_full = target_series.astype("string").fillna("NA")
         total_n_samples = int(labels_series_full.size)
         labels_series = labels_series_full
         keep_indices = np.arange(total_n_samples)
+        cls_candidates = [c for c in classifiers if c in {"logreg", "rf"}]
+        if len(cls_candidates) == 0:
+            print(
+                f"[CROSS-FOLD] Target '{target}' is categorical, but no classification model "
+                "requested (add logreg and/or rf to --cross_fold_classifiers); skipping."
+            )
+            continue
+        if len(cls_metric_fns) == 0:
+            print(
+                f"[CROSS-FOLD] Target '{target}' is categorical but no classification metrics "
+                "requested; skipping."
+            )
+            continue
 
         # Optionally drop singleton mice so StratifiedKFold has support.
         if target == "mouse.id":
@@ -532,7 +947,7 @@ def run_cross_fold_classification(
                 continue
             Z = Z_full[keep_indices]
 
-            for clf_name in classifiers:
+            for clf_name in cls_candidates:
                 # loop over each fold's train/validation indices
                 for fold_idx, (tr_idx, ev_idx) in enumerate(splits):
                     # build a fresh classifier instance per fold
@@ -543,7 +958,7 @@ def run_cross_fold_classification(
                     y_pred = clf_fit.predict(Z[ev_idx])
                     # true labels for the held-out fold
                     y_true = y[ev_idx]
-                    for metric_name, metric_fn in metric_fns.items():
+                    for metric_name, metric_fn in cls_metric_fns.items():
                         score = float(metric_fn(y_true, y_pred))
                         fold_scores.setdefault(
                             (clf_name, metric_name, space_name), []
@@ -596,6 +1011,7 @@ def run_cross_fold_classification(
                 {
                     "split": split_name,
                     "target": target,
+                    "target_type": "classification",
                     "classifier": clf_name,
                     "space": space_name,
                     "metric": metric_name,
@@ -626,8 +1042,8 @@ def run_cross_fold_classification(
             
 
         # Significance: paired t-tests between spaces for each classifier/metric
-        for clf_name in classifiers:
-            for metric_name in metric_fns.keys():
+        for clf_name in cls_candidates:
+            for metric_name in cls_metric_fns.keys():
                 for i in range(len(available_spaces)):
                     for j in range(i + 1, len(available_spaces)):
                         a = available_spaces[i]
@@ -649,6 +1065,7 @@ def run_cross_fold_classification(
                             {
                                 "split": split_name,
                                 "target": target,
+                                "target_type": "classification",
                                 "classifier": clf_name,
                                 "metric": metric_name,
                                 "space_a": a,
@@ -786,7 +1203,16 @@ def build_argparser():
         default=None,
         help=(
             "List of .obs keys to color TRAIN UMAPs by. "
-            "If not provided, defaults to ['broad_cell_type', 'medium_cell_type' (if present)]."
+            "If not provided, defaults include cell-type keys and age_days (if present)."
+        ),
+    )
+    parser.add_argument(
+        "--age_target_col",
+        type=str,
+        default="age_days",
+        help=(
+            "obs column to use for age regression (default: age_days). "
+            "If missing, falls back to age_days/age_numeric when available."
         ),
     )
 
@@ -800,7 +1226,6 @@ def build_argparser():
             "train_eval",
             "test_eval",
             "age_r2_heatmap",
-            "masked_impute",
         ],
         help=(
             "Which eval blocks to run. Choices among: "
@@ -833,16 +1258,31 @@ def build_argparser():
     parser.add_argument(
         "--cross_fold_classifiers",
         nargs="+",
-        choices=["logreg", "rf"],
+        choices=["logreg", "rf", "ridge"],
         default=["logreg", "rf"],
-        help="Classifiers to use for cross-fold evaluation (logreg=Logistic Regression, rf=Random Forest).",
+        help=(
+            "Models to use for cross-fold evaluation "
+            "(logreg/rf for classification targets, ridge for continuous targets like age_days)."
+        ),
     )
     parser.add_argument(
         "--cross_fold_metrics",
         nargs="+",
-        choices=["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"],
+        choices=[
+            "accuracy",
+            "f1_weighted",
+            "precision_weighted",
+            "recall_weighted",
+            "r2",
+            "mae",
+            "rmse",
+        ],
         default=["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"],
-        help="Metrics to report for cross-fold evaluation.",
+        help=(
+            "Metrics to report for cross-fold evaluation. "
+            "Classification targets use accuracy/f1/precision/recall; "
+            "continuous targets use r2/mae/rmse."
+        ),
     )
 
     # Optional W&B integration
@@ -922,6 +1362,7 @@ def main():
         "evals": list(EVALS),
         "umap_top_n_celltypes": args.umap_top_n_celltypes,
         "umap_obs_keys": args.umap_obs_keys,
+        "age_target_col": args.age_target_col,
         "cross_fold_targets": cross_fold_targets,
         "cross_fold_splits": cross_fold_splits,
         "cross_fold_k": args.cross_fold_k,
@@ -979,6 +1420,9 @@ def main():
     print(f"[DATA] TRAIN MuData loaded with mods: {list(mdata_train.mod.keys())}")
     print(f"[DATA] TRAIN 'rna' n_obs: {mdata_train['rna'].n_obs}, n_vars: {mdata_train['rna'].n_vars}")
 
+    train_rna_var_names = pd.Index(mdata_train["rna"].var_names.astype(str))
+    train_splicing_var_names = pd.Index(mdata_train["splicing"].var_names.astype(str))
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_train, args.mapping_csv)
 
@@ -995,6 +1439,8 @@ def main():
     if "X_library_size" in mdata_train["rna"].obsm_keys():
         print("[DATA] Copying TRAIN RNA 'X_library_size' from .obsm to .obs...")
         mdata_train["rna"].obs["X_library_size"] = mdata_train["rna"].obsm["X_library_size"]
+
+    _ensure_batch_key_available(mdata_train, batch_key, split_name="TRAIN")
 
     print("[MODEL] Setting up SPLICEVI on TRAIN MuData ...")
     SPLICEVI.setup_mudata(
@@ -1026,10 +1472,22 @@ def main():
         wandb.log({"total_parameters": total_params})
 
     # Decide classification and UMAP default keys now that TRAIN obs is available
-    umap_color_key = "broad_cell_type" if "broad_cell_type" in mdata_train.obs.columns else "tissue"
+    # Defensive: ensure cell type key selection always finds a valid column
+    umap_color_key = None
+    for candidate in ["broad_cell_type", "tissue", "class", "subclass", "cluster", "cell_type"]:
+        if candidate in mdata_train.obs.columns and mdata_train.obs[candidate].notna().any():
+            umap_color_key = candidate
+            break
+    if umap_color_key is None:
+        # Last resort: use first available obs column
+        for col in mdata_train.obs.columns:
+            if mdata_train.obs[col].notna().any():
+                umap_color_key = col
+                break
+
     cell_type_classification_key = (
         "medium_cell_type"
-        if "medium_cell_type" in mdata_train.obs.columns
+        if "medium_cell_type" in mdata_train.obs.columns and mdata_train.obs["medium_cell_type"].notna().any()
         else umap_color_key
     )
 
@@ -1057,11 +1515,9 @@ def main():
     color_dict = {group: colors[i] for i, group in enumerate(top_groups)}
     color_dict["Other"] = (0.9, 0.9, 0.9, 1.0)
 
-    # UMAP obs keys list (always include highlighted groups first)
+    # UMAP obs keys list
     if args.umap_obs_keys is not None:
         umap_obs_keys = list(dict.fromkeys(args.umap_obs_keys))
-        if "group_highlighted" not in umap_obs_keys:
-            umap_obs_keys.insert(0, "group_highlighted")
         print(f"[UMAP] Using user-provided UMAP obs keys: {umap_obs_keys}")
     else:
         umap_obs_keys = ["group_highlighted"]
@@ -1069,6 +1525,8 @@ def main():
             umap_obs_keys.extend([umap_color_key, cell_type_classification_key])
         else:
             umap_obs_keys.append(umap_color_key)
+        if "age_days" in mdata_train.obs.columns and "age_days" not in umap_obs_keys:
+            umap_obs_keys.append("age_days")
         print(f"[UMAP] UMAP obs keys not provided; using defaults: {umap_obs_keys}")
 
     # Latent spaces
@@ -1199,311 +1657,326 @@ def main():
         if "medium_cell_type" in mdata_train["rna"].obs:
             cell_type_col = "medium_cell_type"
 
-        def run_leiden_on_basis(ad, basis_key: str, neigh_key: str, leiden_key: str):
-            sc.pp.neighbors(ad, use_rep=basis_key, key_added=neigh_key)
-            sc.tl.leiden(
-                ad,
-                neighbors_key=neigh_key,
-                key_added=leiden_key,
-                resolution=LEIDEN_RESOLUTION,
-            )
+        # Defensive: check if cell_type_col exists and has data
+        if cell_type_col not in mdata_train["rna"].obs.columns or mdata_train["rna"].obs[cell_type_col].isna().all():
+            for candidate in ["class", "subclass", "cluster", "cell_type"]:
+                if candidate in mdata_train["rna"].obs.columns and mdata_train["rna"].obs[candidate].notna().any():
+                    cell_type_col = candidate
+                    print(f"[EVAL/CLUSTER] Using fallback cell_type_col: '{cell_type_col}'")
+                    break
+            else:
+                cell_type_col = None
 
-        excl_multi_records = []
-        spaces_order = ["expression", "splicing", "joint"]
-        leiden_keys = {}
+        if cell_type_col is not None:
 
-        print("[EVAL/CLUSTER] Running Leiden clustering per latent space...")
-        for name in ["joint", "expression", "splicing"]:
-            basis_key = f"X_latent_{name}"
-            neigh_key = f"neighbors_{name}_leiden"
-            leiden_key = f"leiden_{name}"
+            def run_leiden_on_basis(ad, basis_key: str, neigh_key: str, leiden_key: str):
+                sc.pp.neighbors(ad, use_rep=basis_key, key_added=neigh_key)
+                sc.tl.leiden(
+                    ad,
+                    neighbors_key=neigh_key,
+                    key_added=leiden_key,
+                    resolution=LEIDEN_RESOLUTION,
+                )
 
-            print(f"[EVAL/CLUSTER] Clustering in space '{name}'...")
-            run_leiden_on_basis(mdata_train["rna"], basis_key, neigh_key, leiden_key)
-            leiden_keys[name] = leiden_key
+            excl_multi_records = []
+            spaces_order = ["expression", "splicing", "joint"]
+            leiden_keys = {}
 
-            n_cl = int(mdata_train["rna"].obs[leiden_key].nunique())
-            print(f"[EVAL/CLUSTER] '{name}' produced {n_cl} clusters.")
-            if run is not None:
-                wandb.log({f"clustering/{name}_leiden_n_clusters": n_cl})
+            print("[EVAL/CLUSTER] Running Leiden clustering per latent space...")
+            for name in ["joint", "expression", "splicing"]:
+                basis_key = f"X_latent_{name}"
+                neigh_key = f"neighbors_{name}_leiden"
+                leiden_key = f"leiden_{name}"
 
-            cts_per_cluster = (
-                mdata_train["rna"]
-                .obs.groupby(leiden_key)[cell_type_col]
-                .apply(lambda s: set(s.astype(str).values))
-            )
-            n_unique = sum(1 for s in cts_per_cluster.values if len(s) == 1)
-            n_multi = sum(1 for s in cts_per_cluster.values if len(s) > 1)
+                print(f"[EVAL/CLUSTER] Clustering in space '{name}'...")
+                run_leiden_on_basis(mdata_train["rna"], basis_key, neigh_key, leiden_key)
+                leiden_keys[name] = leiden_key
 
-            print(
-                f"[EVAL/CLUSTER] '{name}': {n_unique} clusters map to a single cell type, {n_multi} span multiple types."
-            )
+                n_cl = int(mdata_train["rna"].obs[leiden_key].nunique())
+                print(f"[EVAL/CLUSTER] '{name}' produced {n_cl} clusters.")
+                if run is not None:
+                    wandb.log({f"clustering/{name}_leiden_n_clusters": n_cl})
 
-            if run is not None:
-                wandb.log(
+                cts_per_cluster = (
+                    mdata_train["rna"]
+                    .obs.groupby(leiden_key)[cell_type_col]
+                    .apply(lambda s: set(s.astype(str).values))
+                )
+                n_unique = sum(1 for s in cts_per_cluster.values if len(s) == 1)
+                n_multi = sum(1 for s in cts_per_cluster.values if len(s) > 1)
+
+                print(
+                    f"[EVAL/CLUSTER] '{name}': {n_unique} clusters map to a single cell type, {n_multi} span multiple types."
+                )
+
+                if run is not None:
+                    wandb.log(
+                        {
+                            f"clusters/{name}_n_unique_one_celltype": int(n_unique),
+                            f"clusters/{name}_n_multi_celltypes": int(n_multi),
+                        }
+                    )
+
+                excl_multi_records.append(
                     {
-                        f"clusters/{name}_n_unique_one_celltype": int(n_unique),
-                        f"clusters/{name}_n_multi_celltypes": int(n_multi),
+                        "space": name,
+                        "category": "Unique to one cell type",
+                        "count": int(n_unique),
+                    }
+                )
+                excl_multi_records.append(
+                    {
+                        "space": name,
+                        "category": "Multiple cell types",
+                        "count": int(n_multi),
                     }
                 )
 
-            excl_multi_records.append(
-                {
-                    "space": name,
-                    "category": "Unique to one cell type",
-                    "count": int(n_unique),
-                }
+                # Plot joint UMAP colored by Leiden labels for each space
+                plt.figure(figsize=(8, 6))
+                sc.pl.embedding(
+                    mdata_train["rna"],
+                    basis="X_umap_joint",
+                    color=leiden_key,
+                    legend_loc=None,
+                    frameon=True,
+                    show=False,
+                )
+                plt.title(f"TRAIN joint UMAP colored by Leiden ({name})")
+                plt.tight_layout()
+                out_path = (
+                    f"{args.fig_dir}/train_umap_joint_colored_by_{name}_leiden.png"
+                )
+                plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                print(f"[EVAL/CLUSTER] Saved cluster UMAP: {out_path}")
+                if run is not None:
+                    wandb.log(
+                        {
+                            f"clustering/train_umap_joint_colored_by_{name}_leiden": wandb.Image(
+                                out_path
+                            )
+                        }
+                    )
+                plt.close()
+
+            # Bar plot: subclusters per cell type
+            print("[EVAL/CLUSTER] Building bar plot: subclusters per top-20 cell types...")
+            cell_type_for_bars = cell_type_col
+            obs = mdata_train["rna"].obs
+            ct_counts = obs[cell_type_for_bars].value_counts()
+            top20_cts = ct_counts.head(20).index.tolist()
+            print(f"[EVAL/CLUSTER] Top 20 cell types: {top20_cts}")
+
+            records_sub = []
+            for space_name, leiden_key in leiden_keys.items():
+                sub_df = (
+                    obs.loc[obs[cell_type_for_bars].isin(top20_cts), [cell_type_for_bars, leiden_key]]
+                    .groupby(cell_type_for_bars)[leiden_key]
+                    .nunique()
+                    .rename("n_subclusters")
+                    .reset_index()
+                )
+                sub_df["space"] = space_name
+                records_sub.append(sub_df)
+
+            sub_all = pd.concat(records_sub, ignore_index=True)
+            sub_all["space"] = pd.Categorical(
+                sub_all["space"], categories=spaces_order, ordered=True
             )
-            excl_multi_records.append(
-                {
-                    "space": name,
-                    "category": "Multiple cell types",
-                    "count": int(n_multi),
-                }
+            sub_all[cell_type_for_bars] = pd.Categorical(
+                sub_all[cell_type_for_bars], categories=top20_cts, ordered=True
             )
 
-            # Plot joint UMAP colored by Leiden labels for each space
-            plt.figure(figsize=(8, 6))
-            sc.pl.embedding(
-                mdata_train["rna"],
-                basis="X_umap_joint",
-                color=leiden_key,
-                legend_loc=None,
-                frameon=True,
-                show=False,
+            plt.figure(figsize=(max(12, 0.6 * len(top20_cts)), 6))
+            sns.barplot(
+                data=sub_all.sort_values([cell_type_for_bars, "space"]),
+                x=cell_type_for_bars,
+                y="n_subclusters",
+                hue="space",
             )
-            plt.title(f"TRAIN joint UMAP colored by Leiden ({name})")
+            plt.xticks(rotation=45, ha="right")
+            plt.xlabel(cell_type_for_bars)
+            plt.ylabel("Number of Leiden sub-clusters")
+            plt.title(
+                f"TRAIN sub-clusters per cell type (top 20, res={LEIDEN_RESOLUTION})"
+            )
+            plt.tight_layout()
+            out_path = f"{args.fig_dir}/train_bar_subclusters_top20_{cell_type_for_bars}_leiden_res_{LEIDEN_RESOLUTION}.png"
+            plt.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"[EVAL/CLUSTER] Saved bar plot of subclusters: {out_path}")
+            if run is not None:
+                wandb.log({"clustering/train_bar_subclusters_top20": wandb.Image(out_path)})
+            plt.close()
+
+            # Cluster exclusivity plot
+            ex_df = pd.DataFrame(excl_multi_records)
+            ex_df["space"] = pd.Categorical(
+                ex_df["space"], categories=spaces_order, ordered=True
+            )
+            ex_df["category"] = pd.Categorical(
+                ex_df["category"],
+                categories=["Unique to one cell type", "Multiple cell types"],
+                ordered=True,
+            )
+
+            plt.figure(figsize=(8, 5))
+            sns.barplot(data=ex_df, x="category", y="count", hue="space")
+            plt.xlabel("")
+            plt.ylabel("Number of Leiden clusters")
+            plt.title("TRAIN cluster exclusivity across spaces")
             plt.tight_layout()
             out_path = (
-                f"{args.fig_dir}/train_umap_joint_colored_by_{name}_leiden.png"
+                f"{args.fig_dir}/train_clusters_exclusive_vs_multi_by_space.png"
             )
             plt.savefig(out_path, dpi=300, bbox_inches="tight")
-            print(f"[EVAL/CLUSTER] Saved cluster UMAP: {out_path}")
+            print(f"[EVAL/CLUSTER] Saved exclusivity plot: {out_path}")
             if run is not None:
                 wandb.log(
                     {
-                        f"clustering/train_umap_joint_colored_by_{name}_leiden": wandb.Image(
+                        "clustering/train_clusters_exclusive_vs_multi_by_space": wandb.Image(
                             out_path
                         )
                     }
                 )
             plt.close()
 
-        # Bar plot: subclusters per cell type
-        print("[EVAL/CLUSTER] Building bar plot: subclusters per top-20 cell types...")
-        cell_type_for_bars = cell_type_col
-        obs = mdata_train["rna"].obs
-        ct_counts = obs[cell_type_for_bars].value_counts()
-        top20_cts = ct_counts.head(20).index.tolist()
-        print(f"[EVAL/CLUSTER] Top 20 cell types: {top20_cts}")
+            # Pairwise same-cluster consistency
+            print("[EVAL/CLUSTER] Computing pairwise same-cluster consistency...")
+            pairs = [("expression", "joint"), ("splicing", "joint"), ("expression", "splicing")]
 
-        records_sub = []
-        for space_name, leiden_key in leiden_keys.items():
-            sub_df = (
-                obs.loc[obs[cell_type_for_bars].isin(top20_cts), [cell_type_for_bars, leiden_key]]
-                .groupby(cell_type_for_bars)[leiden_key]
-                .nunique()
-                .rename("n_subclusters")
-                .reset_index()
-            )
-            sub_df["space"] = space_name
-            records_sub.append(sub_df)
+            n_cells = mdata_train["rna"].n_obs
+            idx_all = np.arange(n_cells, dtype=np.int32)
 
-        sub_all = pd.concat(records_sub, ignore_index=True)
-        sub_all["space"] = pd.Categorical(
-            sub_all["space"], categories=spaces_order, ordered=True
-        )
-        sub_all[cell_type_for_bars] = pd.Categorical(
-            sub_all[cell_type_for_bars], categories=top20_cts, ordered=True
-        )
+            cluster_members = {}
+            for name in ["joint", "expression", "splicing"]:
+                labs = mdata_train["rna"].obs[leiden_keys[name]].values
+                members = {}
+                for cid, grp in pd.Series(idx_all).groupby(labs):
+                    members[cid] = grp.values.astype(np.int32, copy=False)
+                cluster_members[name] = (labs, members)
 
-        plt.figure(figsize=(max(12, 0.6 * len(top20_cts)), 6))
-        sns.barplot(
-            data=sub_all.sort_values([cell_type_for_bars, "space"]),
-            x=cell_type_for_bars,
-            y="n_subclusters",
-            hue="space",
-        )
-        plt.xticks(rotation=45, ha="right")
-        plt.xlabel(cell_type_for_bars)
-        plt.ylabel("Number of Leiden sub-clusters")
-        plt.title(
-            f"TRAIN sub-clusters per cell type (top 20, res={LEIDEN_RESOLUTION})"
-        )
-        plt.tight_layout()
-        out_path = f"{args.fig_dir}/train_bar_subclusters_top20_{cell_type_for_bars}_leiden_res_{LEIDEN_RESOLUTION}.png"
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"[EVAL/CLUSTER] Saved bar plot of subclusters: {out_path}")
-        if run is not None:
-            wandb.log({"clustering/train_bar_subclusters_top20": wandb.Image(out_path)})
-        plt.close()
+            heat_records = []
+            for a, b in pairs:
+                print(f"[EVAL/CLUSTER] Computing consistency for {a} vs {b}...")
+                labs_a, mem_a = cluster_members[a]
+                labs_b, mem_b = cluster_members[b]
 
-        # Cluster exclusivity plot
-        ex_df = pd.DataFrame(excl_multi_records)
-        ex_df["space"] = pd.Categorical(
-            ex_df["space"], categories=spaces_order, ordered=True
-        )
-        ex_df["category"] = pd.Categorical(
-            ex_df["category"],
-            categories=["Unique to one cell type", "Multiple cell types"],
-            ordered=True,
-        )
+                overlap = np.empty(n_cells, dtype=np.float32)
+                for i in range(n_cells):
+                    ca = labs_a[i]
+                    cb = labs_b[i]
+                    Sa = mem_a[ca]
+                    Sb = mem_b[cb]
+                    if Sa.size <= 1:
+                        overlap[i] = np.nan
+                        continue
+                    Sa_no_i = Sa[Sa != i]
+                    inter_sz = len(set(Sa_no_i).intersection(Sb))
+                    overlap[i] = inter_sz / float(Sa_no_i.size)
 
-        plt.figure(figsize=(8, 5))
-        sns.barplot(data=ex_df, x="category", y="count", hue="space")
-        plt.xlabel("")
-        plt.ylabel("Number of Leiden clusters")
-        plt.title("TRAIN cluster exclusivity across spaces")
-        plt.tight_layout()
-        out_path = (
-            f"{args.fig_dir}/train_clusters_exclusive_vs_multi_by_space.png"
-        )
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"[EVAL/CLUSTER] Saved exclusivity plot: {out_path}")
-        if run is not None:
-            wandb.log(
-                {
-                    "clustering/train_clusters_exclusive_vs_multi_by_space": wandb.Image(
-                        out_path
-                    )
-                }
-            )
-        plt.close()
+                key_cell = f"samecluster_overlap_{a}_vs_{b}"
+                mdata_train["rna"].obs[key_cell] = overlap
 
-        # Pairwise same-cluster consistency
-        print("[EVAL/CLUSTER] Computing pairwise same-cluster consistency...")
-        pairs = [("expression", "joint"), ("splicing", "joint"), ("expression", "splicing")]
-
-        n_cells = mdata_train["rna"].n_obs
-        idx_all = np.arange(n_cells, dtype=np.int32)
-
-        cluster_members = {}
-        for name in ["joint", "expression", "splicing"]:
-            labs = mdata_train["rna"].obs[leiden_keys[name]].values
-            members = {}
-            for cid, grp in pd.Series(idx_all).groupby(labs):
-                members[cid] = grp.values.astype(np.int32, copy=False)
-            cluster_members[name] = (labs, members)
-
-        heat_records = []
-        for a, b in pairs:
-            print(f"[EVAL/CLUSTER] Computing consistency for {a} vs {b}...")
-            labs_a, mem_a = cluster_members[a]
-            labs_b, mem_b = cluster_members[b]
-
-            overlap = np.empty(n_cells, dtype=np.float32)
-            for i in range(n_cells):
-                ca = labs_a[i]
-                cb = labs_b[i]
-                Sa = mem_a[ca]
-                Sb = mem_b[cb]
-                if Sa.size <= 1:
-                    overlap[i] = np.nan
-                    continue
-                Sa_no_i = Sa[Sa != i]
-                inter_sz = len(set(Sa_no_i).intersection(Sb))
-                overlap[i] = inter_sz / float(Sa_no_i.size)
-
-            key_cell = f"samecluster_overlap_{a}_vs_{b}"
-            mdata_train["rna"].obs[key_cell] = overlap
-
-            mean_ov = float(np.nanmean(overlap))
-            median_ov = float(np.nanmedian(overlap))
-            print(
-                f"[EVAL/CLUSTER] {a} vs {b} mean overlap: {mean_ov:.4f}, median: {median_ov:.4f}"
-            )
-            if run is not None:
-                wandb.log(
-                    {
-                        f"clustering/{a}_vs_{b}_samecluster_mean": mean_ov,
-                        f"clustering/{a}_vs_{b}_samecluster_median": median_ov,
-                    }
+                mean_ov = float(np.nanmean(overlap))
+                median_ov = float(np.nanmedian(overlap))
+                print(
+                    f"[EVAL/CLUSTER] {a} vs {b} mean overlap: {mean_ov:.4f}, median: {median_ov:.4f}"
                 )
+                if run is not None:
+                    wandb.log(
+                        {
+                            f"clustering/{a}_vs_{b}_samecluster_mean": mean_ov,
+                            f"clustering/{a}_vs_{b}_samecluster_median": median_ov,
+                        }
+                    )
 
-            if "tissue" in mdata_train["rna"].obs:
-                pair_label = (
-                    mdata_train["rna"]
-                    .obs["tissue"]
-                    .astype("string")
-                    .fillna("NA")
-                    .str.cat(
+                if "tissue" in mdata_train["rna"].obs:
+                    pair_label = (
+                        mdata_train["rna"]
+                        .obs["tissue"]
+                        .astype("string")
+                        .fillna("NA")
+                        .str.cat(
+                            mdata_train["rna"]
+                            .obs[cell_type_col]
+                            .astype("string")
+                            .fillna("NA"),
+                            sep=" | ",
+                        )
+                        .to_numpy()
+                    )
+                else:
+                    pair_label = (
                         mdata_train["rna"]
                         .obs[cell_type_col]
                         .astype("string")
-                        .fillna("NA"),
-                        sep=" | ",
+                        .fillna("NA")
+                        .to_numpy()
                     )
-                    .to_numpy()
+
+                df_tmp = (
+                    pd.DataFrame({"pair_label": pair_label, "overlap": overlap})
+                    .groupby("pair_label", as_index=False)["overlap"]
+                    .mean()
                 )
-            else:
-                pair_label = (
-                    mdata_train["rna"]
-                    .obs[cell_type_col]
-                    .astype("string")
-                    .fillna("NA")
-                    .to_numpy()
+                df_tmp["pct_consistent"] = df_tmp["overlap"].fillna(0.0) * 100.0
+                df_tmp["pair"] = f"{a}_vs_{b}"
+                heat_records.append(
+                    df_tmp[["pair_label", "pair", "pct_consistent"]]
                 )
 
-            df_tmp = (
-                pd.DataFrame({"pair_label": pair_label, "overlap": overlap})
-                .groupby("pair_label", as_index=False)["overlap"]
-                .mean()
-            )
-            df_tmp["pct_consistent"] = df_tmp["overlap"].fillna(0.0) * 100.0
-            df_tmp["pair"] = f"{a}_vs_{b}"
-            heat_records.append(
-                df_tmp[["pair_label", "pair", "pct_consistent"]]
-            )
+            heat_df = pd.concat(heat_records, ignore_index=True)
+            heat_pivot = heat_df.pivot(
+                index="pair_label", columns="pair", values="pct_consistent"
+            ).fillna(0.0)
 
-        heat_df = pd.concat(heat_records, ignore_index=True)
-        heat_pivot = heat_df.pivot(
-            index="pair_label", columns="pair", values="pct_consistent"
-        ).fillna(0.0)
-
-        print("[EVAL/CLUSTER] Plotting clustermap of percent consistent clusters...")
-        plt.close("all")
-        g = sns.clustermap(
-            heat_pivot,
-            cmap="viridis",
-            vmin=0.0,
-            vmax=100.0,
-            metric="euclidean",
-            method="average",
-            figsize=(
-                max(6, 0.25 * heat_pivot.shape[1] + 4),
-                max(6, 0.30 * heat_pivot.shape[0] + 3),
-            ),
-            row_cluster=True,
-            col_cluster=False,
-            annot=False,
-        )
-        g.figure.suptitle(
-            f"TRAIN percent consistent by tissue | cell type (Leiden, res={LEIDEN_RESOLUTION})",
-            y=1.02,
-            fontsize=12,
-        )
-        out_path = f"{args.fig_dir}/train_clustermap_pct_consistent_leiden_res_{LEIDEN_RESOLUTION}.png"
-        g.figure.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"[EVAL/CLUSTER] Saved clustermap: {out_path}")
-        if run is not None:
-            wandb.log(
-                {"clustering/train_clustermap_pct_consistent": wandb.Image(out_path)}
+            print("[EVAL/CLUSTER] Plotting clustermap of percent consistent clusters...")
+            plt.close("all")
+            g = sns.clustermap(
+                heat_pivot,
+                cmap="viridis",
+                vmin=0.0,
+                vmax=100.0,
+                metric="euclidean",
+                method="average",
+                figsize=(
+                    max(6, 0.25 * heat_pivot.shape[1] + 4),
+                    max(6, 0.30 * heat_pivot.shape[0] + 3),
+                ),
+                row_cluster=True,
+                col_cluster=False,
+                annot=False,
             )
-        plt.close(g.figure)
-
-        # AMI
-        print("[EVAL/CLUSTER] Computing adjusted mutual information between clusterings...")
-        for a, b in pairs:
-            ami = adjusted_mutual_info_score(
-                mdata_train["rna"].obs[leiden_keys[a]].values,
-                mdata_train["rna"].obs[leiden_keys[b]].values,
+            g.figure.suptitle(
+                f"TRAIN percent consistent by tissue | cell type (Leiden, res={LEIDEN_RESOLUTION})",
+                y=1.02,
+                fontsize=12,
             )
-            print(f"[EVAL/CLUSTER] AMI {a} vs {b}: {ami:.4f}")
+            out_path = f"{args.fig_dir}/train_clustermap_pct_consistent_leiden_res_{LEIDEN_RESOLUTION}.png"
+            g.figure.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"[EVAL/CLUSTER] Saved clustermap: {out_path}")
             if run is not None:
-                wandb.log({f"clustering/{a}_vs_{b}_AMI": float(ami)})
+                wandb.log(
+                    {"clustering/train_clustermap_pct_consistent": wandb.Image(out_path)}
+                )
+            plt.close(g.figure)
 
-        del heat_records, heat_pivot, heat_df
-        gc.collect()
+            # AMI
+            print("[EVAL/CLUSTER] Computing adjusted mutual information between clusterings...")
+            for a, b in pairs:
+                ami = adjusted_mutual_info_score(
+                    mdata_train["rna"].obs[leiden_keys[a]].values,
+                    mdata_train["rna"].obs[leiden_keys[b]].values,
+                )
+                print(f"[EVAL/CLUSTER] AMI {a} vs {b}: {ami:.4f}")
+                if run is not None:
+                    wandb.log({f"clustering/{a}_vs_{b}_AMI": float(ami)})
+
+            del heat_records, heat_pivot, heat_df
+            gc.collect()
+        else:
+            print("[EVAL/CLUSTER] Clustering skipped - no suitable cell type column found.")
+
     else:
         print("[EVAL/CLUSTER] Clustering evaluation skipped by config.")
 
@@ -1518,6 +1991,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="joint",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("joint"),
@@ -1528,6 +2002,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="expression",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("expression"),
@@ -1538,6 +2013,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_train.get("splicing"),
@@ -1581,12 +2057,23 @@ def main():
     print(f"[DATA] TEST MuData loaded with mods: {list(mdata_test.mod.keys())}")
     print(f"[DATA] TEST 'rna' n_obs: {mdata_test['rna'].n_obs}, n_vars: {mdata_test['rna'].n_vars}")
 
+    mdata_test = _ensure_feature_compatibility_or_fail(
+        mdata_test,
+        train_rna_var_names,
+        train_splicing_var_names,
+        split_name="TEST",
+        train_path=args.train_mdata_path,
+        source_path=args.test_mdata_path,
+    )
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_test, args.mapping_csv)
 
     if "X_library_size" in mdata_test["rna"].obsm_keys():
         print("[DATA] Copying TEST RNA 'X_library_size' from .obsm to .obs...")
         mdata_test["rna"].obs["X_library_size"] = mdata_test["rna"].obsm["X_library_size"]
+
+    _ensure_batch_key_available(mdata_test, batch_key, split_name="TEST")
 
     print("[MODEL] Setting up SPLICEVI on TEST MuData ...")
     SPLICEVI.setup_mudata(
@@ -1628,6 +2115,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="joint",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("joint"),
@@ -1638,6 +2126,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="expression",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("expression"),
@@ -1648,6 +2137,7 @@ def main():
             model,
             umap_color_key,
             cell_type_classification_key,
+            args.age_target_col,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
             precomputed_Z=latent_spaces_test.get("splicing"),
@@ -1767,6 +2257,16 @@ def main():
                 mdata_masked.mod["splicing"].obs.rename(
                 columns={"donor_id": "mouse.id"},
                 inplace=True)
+
+                mdata_masked = _ensure_feature_compatibility_or_fail(
+                    mdata_masked,
+                    train_rna_var_names,
+                    train_splicing_var_names,
+                    split_name=f"IMPUTE/{tag}",
+                    train_path=args.train_mdata_path,
+                    source_path=masked_path,
+                )
+
                 print(
                     f"[EVAL/IMPUTE/{tag}] Masked MuData loaded. 'rna' n_obs: {mdata_masked['rna'].n_obs}"
                 )
@@ -1782,6 +2282,12 @@ def main():
                     mdata_masked["rna"].obs["X_library_size"] = mdata_masked["rna"].obsm[
                         "X_library_size"
                     ]
+
+                _ensure_batch_key_available(
+                    mdata_masked,
+                    batch_key,
+                    split_name=f"IMPUTE/{tag}",
+                )
 
                 print(f"[EVAL/IMPUTE/{tag}] Setting up SPLICEVI on masked MuData...")
                 SPLICEVI.setup_mudata(
@@ -1801,6 +2307,17 @@ def main():
                 model.module.eval()
 
                 if args.masked_test_mdata_is_resampled:
+                    _require_layers(
+                        ad_masked,
+                        ["junc_ratio_original"],
+                        context=f"EVAL/IMPUTE/{tag}",
+                    )
+                    if args.min_atse_count != -1:
+                        _require_layers(
+                            ad_masked,
+                            ["cell_by_cluster_matrix_original"],
+                            context=f"EVAL/IMPUTE/{tag}",
+                        )
                     # ── Resampled mode ────────────────────────────────────────
                     # Ground truth = junc_ratio_original (pre-resampling values)
                     # Evaluate only where junc_ratio_original > 0
@@ -1869,6 +2386,11 @@ def main():
                     )
                 else:
                     # ── Legacy masked mode ────────────────────────────────────
+                    _require_layers(
+                        ad_masked,
+                        ["junc_ratio_masked_original", "junc_ratio_masked_bin_mask"],
+                        context=f"EVAL/IMPUTE/{tag}",
+                    )
                     masked_orig = ad_masked.layers["junc_ratio_masked_original"]
                     if not sparse.isspmatrix_csr(masked_orig):
                         masked_orig = sparse.csr_matrix(masked_orig)
@@ -1894,6 +2416,28 @@ def main():
                 if pairs_total == 0:
                     print(
                         f"[EVAL/IMPUTE/{tag}] No eval entries found; skipping correlation."
+                    )
+                    IMPUTE_RECORDS.append(
+                        {
+                            "tag": tag,
+                            "mode": "resampled" if args.masked_test_mdata_is_resampled else "legacy",
+                            "masked_file": masked_path,
+                            "n_eval_entries": 0,
+                            "pearson": np.nan,
+                            "spearman": np.nan,
+                            "l1_mean": np.nan,
+                            "l1_median": np.nan,
+                            "l1_p90": np.nan,
+                            "pred_min": np.nan,
+                            "pred_max": np.nan,
+                            "smape": np.nan,
+                            "cosine_sim": np.nan,
+                            "minmax_ratio": np.nan,
+                            "rmse": np.nan,
+                            "impute_batch_size": bs,
+                            "impute_filter_boundary_psi": bool(args.impute_filter_boundary_psi),
+                            "min_atse_count": int(args.min_atse_count),
+                        }
                     )
                 else:
                     # Extract values at eval positions without densifying
@@ -1954,6 +2498,28 @@ def main():
                         f"cosine: {cosine_sim:.4f}, minmax_ratio: {minmax_ratio:.4f}, "
                         f"RMSE: {rmse:.4e}"
                     )
+                    IMPUTE_RECORDS.append(
+                        {
+                            "tag": tag,
+                            "mode": "resampled" if args.masked_test_mdata_is_resampled else "legacy",
+                            "masked_file": masked_path,
+                            "n_eval_entries": int(pairs_total),
+                            "pearson": pearson_m,
+                            "spearman": spearman_m,
+                            "l1_mean": l1_mean,
+                            "l1_median": l1_median,
+                            "l1_p90": l1_p90,
+                            "pred_min": pred_min,
+                            "pred_max": pred_max,
+                            "smape": smape,
+                            "cosine_sim": cosine_sim,
+                            "minmax_ratio": minmax_ratio,
+                            "rmse": rmse,
+                            "impute_batch_size": bs,
+                            "impute_filter_boundary_psi": bool(args.impute_filter_boundary_psi),
+                            "min_atse_count": int(args.min_atse_count),
+                        }
+                    )
 
                     if run is not None:
                         wandb.log(
@@ -1990,6 +2556,15 @@ def main():
                 except NameError: pass
                 gc.collect()
                 torch.cuda.empty_cache()
+            if len(IMPUTE_RECORDS) > 0:
+                impute_csv = os.path.join(args.fig_dir, "imputation_metrics.csv")
+                pd.DataFrame(IMPUTE_RECORDS).to_csv(impute_csv, index=False)
+                print(
+                    f"[EVAL/IMPUTE] Wrote imputation metrics to {impute_csv} "
+                    f"({len(IMPUTE_RECORDS)} rows)."
+                )
+                if run is not None:
+                    wandb.log({"impute-test/metrics_csv_path": impute_csv})
     else:
         print("[EVAL/IMPUTE] Masked imputation eval skipped by config.")
 

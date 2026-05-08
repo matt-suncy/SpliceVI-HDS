@@ -77,7 +77,7 @@ EVALS=(
   # test_eval
   # cross_fold_classification
   # age_r2_heatmap
-  masked_impute
+  # masked_impute
 )
 
 # 4) UMAP and imputation config
